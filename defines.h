@@ -29,9 +29,8 @@
 //--------------------------------------------------------------------+
 // HARDWARE CONFIGURATION
 //--------------------------------------------------------------------+
-// RP2350 overclocked to 240MHz for real-time tracking
-// NOTE: This increases power draw and may be unstable on some boards.
-#define DEFAULT_CPU_FREQ 240000
+// RP2350 configured to 120MHz (multiple of 12MHz for PIO-USB, within 150MHz spec)
+#define DEFAULT_CPU_FREQ 120000
 
 #ifndef CPU_FREQ
 #define CPU_FREQ DEFAULT_CPU_FREQ
@@ -89,8 +88,9 @@
 
 #define BRIDGE_UART_TX_PIN      KMBOX_UART_TX_PIN
 #define BRIDGE_UART_RX_PIN      KMBOX_UART_RX_PIN
-#define KMBOX_UART_BAUDRATE     3000000  // Baud rate (must match bridge) - 3 Mbaud for max throughput
-                                        // At 48MHz clk_peri: 48000000/3000000 = 16 (exact, 0 ppm error)
+#ifndef KMBOX_UART_BAUDRATE
+#define KMBOX_UART_BAUDRATE     115200   // 115200 baud for CH340N UART integration
+#endif
 #define KMBOX_UART_FIFO_SIZE    32       // UART FIFO size for buffering
 
 //--------------------------------------------------------------------+

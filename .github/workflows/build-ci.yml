@@ -2,17 +2,21 @@ name: Build CI
 
 on:
   push:
-    branches: [ master, main, develop ]
+    branches: [ master, main, develop, waveshare-bringup ]
   pull_request:
-    branches: [ master, main, develop ]
+    branches: [ master, main, develop, waveshare-bringup ]
 
 jobs:
   build-kmbox:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [metro, pico2]
+        target: [waveshare, metro, pico2]
         include:
+          - target: waveshare
+            board: waveshare_rp2350_usb_c
+            platform: rp2350-arm-s
+            artifact_name: PIOKMbox-WaveshareRP2350USBC
           - target: metro
             board: adafruit_metro_rp2350
             platform: rp2350-arm-s
@@ -174,6 +178,7 @@ jobs:
         cd tools
         x86_64-w64-mingw32-gcc -Wall -Wextra -O2 \
           -I../lib/wire-protocol/include \
+          -I../lib/hid-defs/include \
           -o kmbox_relay.exe kmbox_relay.c -lws2_32
         echo "Build successful:"
         ls -la kmbox_relay.exe
@@ -183,6 +188,7 @@ jobs:
         cd tools
         gcc -Wall -Wextra -O2 \
           -I../lib/wire-protocol/include \
+          -I../lib/hid-defs/include \
           -o kmbox_relay kmbox_relay.c
         echo "Build successful:"
         ls -la kmbox_relay
@@ -212,6 +218,7 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "| Target | Status |" >> $GITHUB_STEP_SUMMARY
         echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| KMBox Waveshare RP2350-USB-C | ${{ needs.build-kmbox.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| KMBox Metro RP2350 | ${{ needs.build-kmbox.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| KMBox Pico 2 | ${{ needs.build-kmbox.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Bridge Metro RP2350 | ${{ needs.build-bridge.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
