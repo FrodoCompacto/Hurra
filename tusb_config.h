@@ -81,12 +81,18 @@
 #endif
 
 //------------- CLASS -------------//
-// Support up to 4 HID interfaces for faithful multi-interface device mirroring,
-// plus 1 dedicated KMBox control interface (5 total).
-// Gaming mice expose 2-4 HID interfaces (mouse, keyboard-macros, vendor).
-// We mirror all of them on the device side so the downstream PC sees an
-// identical interface layout.
+// Optional 5th KMBox USB HID control interface (disabled by default so the
+// downstream PC sees only the exact mirrored HID interfaces of the real device).
+#ifndef ENABLE_KMBOX_USB_CONTROL
+#define ENABLE_KMBOX_USB_CONTROL 0
+#endif
+
+// Support up to 4 HID interfaces for faithful multi-interface device mirroring.
+#if ENABLE_KMBOX_USB_CONTROL
 #define CFG_TUD_HID              5
+#else
+#define CFG_TUD_HID              4
+#endif
 
 // HID buffer size - should be sufficient to hold ID (if any) + Data
 #define CFG_TUD_HID_EP_BUFSIZE   64

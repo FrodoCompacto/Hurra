@@ -225,11 +225,14 @@
 #define USB_STACK_ERROR_THRESHOLD       50      // Number of consecutive errors before reset
 
 // USB descriptor configuration
-#define MAX_DEVICE_HID_INTERFACES       4       // Max HID interfaces to mirror (matches CFG_TUD_HID - 1)
+#define MAX_DEVICE_HID_INTERFACES       4       // Max HID interfaces to mirror
 #define MIRROR_ITF_DESC_MAX             512     // Max HID report descriptor per non-mouse interface
-#define DESC_CONFIG_RUNTIME_MAX         320     // Max runtime config descriptor (9 + 5*48 = 249 typical)
+#define DESC_CONFIG_RUNTIME_MAX         320     // Max runtime config descriptor
 
-// KMBox USB HID Control Interface (5th HID interface, always present)
+// Optional KMBox USB HID Control Interface (disabled by default for descriptor fidelity)
+#ifndef ENABLE_KMBOX_USB_CONTROL
+#define ENABLE_KMBOX_USB_CONTROL        0
+#endif
 #define KMBOX_HID_INTERFACE_INDEX       4       // 0-indexed, after up to 4 mirrored interfaces
 #define KMBOX_HID_REPORT_LEN            64      // Output/feature report size in bytes
 #define KMBOX_USB_PREFIX_0              0xF0    // Magic byte 0: KMBox command marker
@@ -366,8 +369,8 @@
 // MANUFACTURER/PRODUCT STRINGS
 //--------------------------------------------------------------------+
 
-#define MANUFACTURER_STRING             "Hurricane"
-#define PRODUCT_STRING                  "PIOKM Box"
+#define MANUFACTURER_STRING             "Generic"
+#define PRODUCT_STRING                  "USB Input Device"
 
 //--------------------------------------------------------------------+
 // BUILD CONFIGURATION

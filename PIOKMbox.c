@@ -58,8 +58,10 @@ static bool initialize_system(void);
 static bool initialize_usb_device(void);
 static void main_application_loop(void);
 
+#if PIN_BUTTON != 255
 // Button handling functions
 static void process_button_input(system_state_t* state, uint32_t current_time);
+#endif
 
 
 // Utility functions
@@ -426,8 +428,16 @@ int main(void) {
     multicore_reset_core1();
     multicore_launch_core1(core1_main);
     
-    // Give core1 time to initialize before USB device init
-    sleep_ms(100);
+    // Allow Core1 time to enumerate any pre-attached USB hub + HID receiver
+    // (up to 1200ms) so tud_init() presents the cloned VID/PID on the very
+    // first USB connection to the PC, avoiding boot double-enumeration.
+    for (int wait_step = 0; wait_step < 120; wait_step++) {
+        sleep_ms(10);
+        if (usb_hid_is_host_ready()) {
+            break;
+        }
+    }
+    usb_hid_clear_pending_reenumeration();
 #endif
     
     if (!initialize_usb_device()) {

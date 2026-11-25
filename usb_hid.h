@@ -40,6 +40,12 @@ void hid_host_task(void);
 void process_kbd_report(hid_keyboard_report_t const *report);
 void process_mouse_report(hid_mouse_report_t const *report);
 
+// Queued synthetic keyboard control (thread-safe, respects endpoint readiness)
+void kmbox_keyboard_tap(uint8_t modifiers, const uint8_t keycodes[6], uint16_t hold_ms);
+void kmbox_keyboard_key_down(uint8_t modifiers, uint8_t keycode);
+void kmbox_keyboard_key_up(uint8_t modifiers, uint8_t keycode);
+void kmbox_keyboard_release_all(void);
+
 // Utility functions
 bool find_key_in_report(hid_keyboard_report_t const *report, uint8_t keycode);
 
@@ -49,6 +55,9 @@ bool usb_host_enable_power(void);
 bool get_caps_lock_state(void);
 bool is_mouse_connected(void);
 bool is_keyboard_connected(void);
+bool usb_hid_is_host_ready(void);
+void usb_hid_clear_pending_reenumeration(void);
+uint8_t usb_hid_get_mirrored_itf_count(void);
 
 // USB stack initialization tracking
 void usb_device_mark_initialized(void);

@@ -408,11 +408,16 @@ uint32_t neopixel_rgb_to_grb(uint32_t rgb)
         return 0;
     }
 
+#ifdef WAVESHARE_RP2350_USB_C
+    // Waveshare RP2350-USB-C onboard WS2812 uses RGB wire order
+    return rgb;
+#else
     const uint8_t r = (rgb >> 16) & 0xFF;
     const uint8_t g = (rgb >> 8) & 0xFF;
     const uint8_t b = rgb & 0xFF;
 
     return (g << 16) | (r << 8) | b;
+#endif
 }
 
 uint32_t neopixel_apply_brightness(uint32_t color, float brightness)
@@ -758,8 +763,12 @@ void neopixel_signal_activity(uint32_t color)
     const uint8_t r = (uint8_t)(((color >> 16) & 0xFF) * (uint16_t)ACTIVITY_FLASH_BRIGHTNESS >> 8);
     const uint8_t g = (uint8_t)(((color >> 8)  & 0xFF) * (uint16_t)ACTIVITY_FLASH_BRIGHTNESS >> 8);
     const uint8_t b = (uint8_t)((color         & 0xFF) * (uint16_t)ACTIVITY_FLASH_BRIGHTNESS >> 8);
-    const uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
-    s_led_shadow_grb = grb << WS2812_RGB_SHIFT;
+#ifdef WAVESHARE_RP2350_USB_C
+    const uint32_t wire = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+#else
+    const uint32_t wire = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+#endif
+    s_led_shadow_grb = wire << WS2812_RGB_SHIFT;
     s_led_activity_pending = true;
     s_led_activity_expire_us = time_us_32() + (ACTIVITY_FLASH_DURATION_MS * 1000u);
 }

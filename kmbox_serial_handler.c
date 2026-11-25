@@ -15,13 +15,17 @@
 #include "xbox_host.h"
 #include "uart_buffers.h"
 #include "dcp_helpers.h"
+#include "watchdog.h"
 #include "pico/stdlib.h"
+#include "pico/bootrom.h"
+#include "pico/multicore.h"
 #include "hardware/uart.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
 #include "hardware/clocks.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
+#include "hardware/watchdog.h"
 #include "pico/time.h"
 #include <string.h>
 #include <stdio.h>
@@ -262,9 +266,36 @@ static bool uart_send_bytes(const uint8_t *data, size_t len) {
     return true;
 }
 
-static bool uart_send_string(const char *str) {
-    if (!str) return true;
-    return uart_send_bytes((const uint8_t*)str, strlen(str));
+// Reliable text/diagnostic TX: waits briefly if a short periodic DMA packet (e.g.
+// 8-byte bridge ping = ~0.7ms at 115200 baud) is mid-flight, then sends the entire
+// text payload in a single non-blocking DMA transfer so multi-field responses
+// (KMBOX_INFO, ECHO, PONG) are never truncated.
+static bool uart_send_text_reliable(const uint8_t *data, size_t len) {
+    if (!data || len == 0) return true;
+
+    if (uart_tx_dma_chan >= 0 && dma_tx_busy) {
+        uint32_t wait_start = time_us_32();
+        while (dma_tx_busy && (uint32_t)(time_us_32() - wait_start) < 15000u) {
+            tight_loop_contents();
+        }
+    }
+    return uart_send_bytes(data, len);
+}
+
+// Flush any in-flight UART DMA/FIFO and transmit a final message synchronously
+// before rebooting or entering BOOTSEL mode.
+static void uart_flush_and_send_blocking(const char *str) {
+    if (uart_tx_dma_chan >= 0 && dma_tx_busy) {
+        uint32_t wait_start = time_us_32();
+        while (dma_tx_busy && (uint32_t)(time_us_32() - wait_start) < 50000u) {
+            tight_loop_contents();
+        }
+    }
+    uart_tx_wait_blocking(KMBOX_UART);
+    if (str && str[0] != '\0') {
+        uart_write_blocking(KMBOX_UART, (const uint8_t *)str, strlen(str));
+        uart_tx_wait_blocking(KMBOX_UART);
+    }
 }
 
 //--------------------------------------------------------------------+
@@ -274,15 +305,18 @@ static bool uart_send_string(const char *str) {
 void kmbox_send_response(const char *response) {
     if (!response) return;
     size_t len = strlen(response);
-    char buf[256];
+    char buf[512];
     if (len + 2 <= sizeof(buf)) {
         memcpy(buf, response, len);
         buf[len] = '\r';
         buf[len + 1] = '\n';
-        uart_send_bytes((const uint8_t *)buf, len + 2);
+        uart_send_text_reliable((const uint8_t *)buf, len + 2);
     } else {
-        uart_send_string(response);
-        uart_send_string("\r\n");
+        size_t chunk = sizeof(buf) - 2;
+        memcpy(buf, response, chunk);
+        buf[chunk] = '\r';
+        buf[chunk + 1] = '\n';
+        uart_send_text_reliable((const uint8_t *)buf, sizeof(buf));
     }
 }
 
@@ -464,16 +498,40 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
         }
         
         case FAST_CMD_KEY_COMBO: {
-            // Handles both KEY_PRESS and KEY_COMBO (same command ID 0x0C)
+            // [0x0C][modifiers][keycode][k1][k2][k3][k4][flags]
+            // flags == 0 (default): timed tap (press + guaranteed release via g_kbd_queue)
+            // flags == 1: press/hold synthetic state
+            // flags == 2 (or all-zero payload): release all synthetic keys
             const fast_cmd_combo_t *c = (const fast_cmd_combo_t *)pkt;
-            hid_keyboard_report_t report = {.modifier = c->modifiers};
+            uint8_t modifiers = c->modifiers;
+            uint8_t keys6[6] = {0};
             uint8_t n = 0;
-            // Use keycode field for single key, or keys array for combo
-            if (c->keycode) report.keycode[n++] = c->keycode;
-            for (int i = 0; i < 4 && c->keys[i] && n < 6; i++) report.keycode[n++] = c->keys[i];
-            process_kbd_report(&report);
-            memset(&report, 0, sizeof(report));
-            process_kbd_report(&report);
+
+            if (c->keycode >= 0xE0 && c->keycode <= 0xE7) {
+                modifiers |= (uint8_t)(1u << (c->keycode - 0xE0));
+            } else if (c->keycode != 0) {
+                keys6[n++] = c->keycode;
+            }
+
+            for (int i = 0; i < 4 && c->keys[i] != 0; i++) {
+                uint8_t kc = c->keys[i];
+                if (kc >= 0xE0 && kc <= 0xE7) {
+                    modifiers |= (uint8_t)(1u << (kc - 0xE0));
+                } else if (n < 6) {
+                    keys6[n++] = kc;
+                }
+            }
+
+            uint8_t mode_flag = pkt[7];
+            if (mode_flag == 2 || (modifiers == 0 && n == 0)) {
+                kmbox_keyboard_release_all();
+            } else if (mode_flag == 1) {
+                hid_keyboard_report_t report = {.modifier = modifiers};
+                memcpy(report.keycode, keys6, sizeof(keys6));
+                process_kbd_report(&report);
+            } else {
+                kmbox_keyboard_tap(modifiers, keys6, 0);
+            }
             fast_cmd_count++;
             return true;
         }
@@ -717,9 +775,30 @@ static const char* __not_in_flash_func(parse_int16)(const char *p, int16_t *out)
 // Text Protocol Handling
 //--------------------------------------------------------------------+
 
+static void perform_safe_reboot(bool enter_bootsel) {
+    kmbox_keyboard_release_all();
+    kmbox_update_physical_buttons(0);
+    uart_flush_and_send_blocking(enter_bootsel ? "KMBOX_BOOTSEL_OK\r\n" : "KMBOX_REBOOTING\r\n");
+
+    watchdog_core0_heartbeat();
+    watchdog_core1_heartbeat();
+    tud_disconnect();
+    sleep_ms(50);
+
+    if (enter_bootsel) {
+        multicore_reset_core1();
+        reset_usb_boot(0, 0);
+    } else {
+        watchdog_reboot(0, 0, 0);
+    }
+    while (1) {
+        tight_loop_contents();
+    }
+}
+
 static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     (void)now_ms;
-    
+
     // Mouse move: M<x>,<y>
     if (len >= 3 && line[0] == 'M') {
         int16_t x, y;
@@ -732,7 +811,7 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
             }
         }
     }
-    
+
     // Wheel: W<delta>
     if (len >= 2 && line[0] == 'W') {
         int16_t delta;
@@ -742,7 +821,7 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
             return true;
         }
     }
-    
+
     // Buttons: B<mask>
     if (len >= 2 && line[0] == 'B') {
         int16_t mask;
@@ -752,28 +831,124 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
             return true;
         }
     }
-    
+
+    // Keyboard injection text commands:
+    //   KP<keycode>[,<modifiers>[,<hold_ms>]]  -> tap key (press + timed release)
+    //   KD<keycode>[,<modifiers>]              -> key down (press & hold)
+    //   KU<keycode>[,<modifiers>]              -> key up (release key/modifier)
+    //   KRA or KR                              -> release all synthetic keys
+    if (len >= 2 && line[0] == 'K' && line[1] != 'M') {
+        if ((len == 2 && line[1] == 'R') || (len == 3 && line[1] == 'R' && line[2] == 'A')) {
+            kmbox_keyboard_release_all();
+            return true;
+        }
+        if (len >= 3 && (line[1] == 'P' || line[1] == 'D' || line[1] == 'U')) {
+            int16_t kc_raw = 0, mod_raw = 0, hold_raw = 0;
+            const char *p = parse_int16(line + 2, &kc_raw);
+            if (p && kc_raw >= 0 && kc_raw <= 255) {
+                if (*p == ',') {
+                    p = parse_int16(p + 1, &mod_raw);
+                    if (p && *p == ',' && line[1] == 'P') {
+                        (void)parse_int16(p + 1, &hold_raw);
+                    }
+                }
+                uint8_t kc = (uint8_t)kc_raw;
+                uint8_t mod = (mod_raw >= 0 && mod_raw <= 255) ? (uint8_t)mod_raw : 0;
+                if (kc >= 0xE0 && kc <= 0xE7) {
+                    mod |= (uint8_t)(1u << (kc - 0xE0));
+                    kc = 0;
+                }
+                if (line[1] == 'P') {
+                    uint8_t keys6[6] = {kc, 0, 0, 0, 0, 0};
+                    uint16_t hold_ms = (hold_raw > 0) ? (uint16_t)hold_raw : 0;
+                    kmbox_keyboard_tap(mod, keys6, hold_ms);
+                } else if (line[1] == 'D') {
+                    kmbox_keyboard_key_down(mod, kc);
+                } else {
+                    kmbox_keyboard_key_up(mod, kc);
+                }
+                return true;
+            }
+        }
+    }
+
+    // Standard km.* keyboard & reboot compatibility commands:
+    //   km.press(<kc>[,<hold_ms>]), km.down(<kc>), km.up(<kc>), km.reboot()
+    if (len >= 6 && strncmp(line, "km.", 3) == 0) {
+        if (strncmp(line + 3, "reboot()", 8) == 0) {
+            perform_safe_reboot(false);
+            return true;
+        }
+        if (strncmp(line + 3, "press(", 6) == 0 ||
+            strncmp(line + 3, "down(", 5) == 0 ||
+            strncmp(line + 3, "up(", 3) == 0) {
+            char op = line[3]; // 'p', 'd', or 'u'
+            const char *arg = strchr(line + 3, '(');
+            int16_t kc_raw = 0, hold_raw = 0;
+            if (arg) {
+                const char *p = parse_int16(arg + 1, &kc_raw);
+                if (p && kc_raw >= 0 && kc_raw <= 255) {
+                    while (*p == ' ') p++;
+                    if (*p == ',' && op == 'p') {
+                        const char *p2 = p + 1;
+                        while (*p2 == ' ') p2++;
+                        (void)parse_int16(p2, &hold_raw);
+                    }
+                    uint8_t kc = (uint8_t)kc_raw;
+                    uint8_t mod = 0;
+                    if (kc >= 0xE0 && kc <= 0xE7) {
+                        mod = (uint8_t)(1u << (kc - 0xE0));
+                        kc = 0;
+                    }
+                    if (op == 'p') {
+                        uint8_t keys6[6] = {kc, 0, 0, 0, 0, 0};
+                        kmbox_keyboard_tap(mod, keys6, (hold_raw > 0) ? (uint16_t)hold_raw : 0);
+                    } else if (op == 'd') {
+                        kmbox_keyboard_key_down(mod, kc);
+                    } else {
+                        kmbox_keyboard_key_up(mod, kc);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
     // Ping: P
-    if (len >= 1 && line[0] == 'P') {
+    if (len == 1 && line[0] == 'P') {
         kmbox_send_response("KMBOX_PONG");
         return true;
     }
-    
-    // Echo: E<data>
+
+    // Echo: E<data> (consolidated into a single DMA buffer so payload is never dropped)
     if (len >= 2 && line[0] == 'E') {
-        uart_send_string("ECHO:");
-        uart_send_string(line + 1);
-        uart_send_string("\r\n");
+        char echo_buf[160];
+        int n = snprintf(echo_buf, sizeof(echo_buf), "ECHO:%s\r\n", line + 1);
+        if (n > 0) {
+            size_t send_len = ((size_t)n < sizeof(echo_buf)) ? (size_t)n : (sizeof(echo_buf) - 1);
+            uart_send_text_reliable((const uint8_t *)echo_buf, send_len);
+        }
         return true;
     }
-    
+
+    // Safe Reboot / UF2 Bootloader entry over UART (no physical RUN/BOOT button needed)
+    if ((len == 6 && strncmp(line, "REBOOT", 6) == 0) ||
+        (len >= 12 && strncmp(line, "KMBOX_REBOOT", 12) == 0)) {
+        perform_safe_reboot(false);
+        return true;
+    }
+    if (len >= 13 && strncmp(line, "KMBOX_BOOTSEL", 13) == 0) {
+        perform_safe_reboot(true);
+        return true;
+    }
+
     // Protocol: KMBOX_BRIDGE_SYNC
     if (len >= 17 && strncmp(line, "KMBOX_BRIDGE_SYNC", 17) == 0) {
         kmbox_send_response("KMBOX_READY");
         set_connection_state(BRIDGE_STATE_CONNECTED);
         return true;
     }
-    
+
     // Protocol: KMBOX_PING
     if (len >= 10 && strncmp(line, "KMBOX_PING", 10) == 0) {
         kmbox_send_response("KMBOX_PONG:v" KMBOX_PROTOCOL_VERSION);
@@ -782,21 +957,21 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
         }
         return true;
     }
-    
+
     // Protocol: KMBOX_CONNECT
     if (len >= 13 && strncmp(line, "KMBOX_CONNECT", 13) == 0) {
         kmbox_send_response("KMBOX_READY");
         set_connection_state(BRIDGE_STATE_CONNECTED);
         return true;
     }
-    
+
     // Protocol: KMBOX_DISCONNECT
     if (len >= 16 && strncmp(line, "KMBOX_DISCONNECT", 16) == 0) {
         kmbox_send_response("KMBOX_BYE");
         set_connection_state(BRIDGE_STATE_WAITING);
         return true;
     }
-    
+
     // Protocol: KMBOX_STATUS
     if (len >= 12 && strncmp(line, "KMBOX_STATUS", 12) == 0) {
         static const char *responses[] = {
@@ -811,57 +986,50 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
         }
         return true;
     }
-    
-    // Protocol: KMBOX_INFO
-    // Note: This is a diagnostic command, not hot path, but we still optimize it
+
+    // Protocol: KMBOX_INFO — consolidated into ONE single DMA transfer so all
+    // diagnostic lines arrive intact at 115200 baud with zero dropped chunks.
     if (len >= 10 && strncmp(line, "KMBOX_INFO", 10) == 0) {
-        char resp[128];
+        char info_buf[512];
         uint16_t vid = get_attached_vid();
         uint16_t pid = get_attached_pid();
         const char *mfr = get_attached_manufacturer();
         const char *prod = get_attached_product();
-        
-        // Format hex values manually (faster than snprintf for simple hex)
-        static const char hex[] = "0123456789ABCDEF";
-        resp[0] = 'K'; resp[1] = 'M'; resp[2] = 'B'; resp[3] = 'O'; resp[4] = 'X'; resp[5] = '_';
-        resp[6] = 'V'; resp[7] = 'I'; resp[8] = 'D'; resp[9] = ':';
-        resp[10] = hex[(vid >> 12) & 0xF];
-        resp[11] = hex[(vid >> 8) & 0xF];
-        resp[12] = hex[(vid >> 4) & 0xF];
-        resp[13] = hex[vid & 0xF];
-        resp[14] = '\0';
-        kmbox_send_response(resp);
-        
-        resp[6] = 'P'; resp[7] = 'I'; resp[8] = 'D';
-        resp[10] = hex[(pid >> 12) & 0xF];
-        resp[11] = hex[(pid >> 8) & 0xF];
-        resp[12] = hex[(pid >> 4) & 0xF];
-        resp[13] = hex[pid & 0xF];
-        kmbox_send_response(resp);
-        
-        // Manufacturer and product need snprintf for string concatenation
-        snprintf(resp, sizeof(resp), "KMBOX_MFR:%s", mfr[0] ? mfr : "Unknown");
-        kmbox_send_response(resp);
-        snprintf(resp, sizeof(resp), "KMBOX_PROD:%s", prod[0] ? prod : "Unknown");
-        kmbox_send_response(resp);
-        
-        // Humanization info - still needs snprintf for multiple integers
+
         uint32_t total_inj = 0, frames_proc = 0, q_overflows = 0;
         uint8_t q_count = 0;
         smooth_get_stats(&total_inj, &frames_proc, &q_overflows, &q_count);
-        snprintf(resp, sizeof(resp), "KMBOX_INFO:hmode=%d,imode=%d,max=%d,vel=%d,qd=%d,qc=%d,inj=%lu,ovf=%lu",
-                 (int)smooth_get_humanization_mode(),
-                 (int)smooth_get_inject_mode(),
-                 (int)smooth_get_max_per_frame(),
-                 (int)smooth_get_velocity_matching(),
-                 (int)q_count,
-                 (int)SMOOTH_QUEUE_SIZE,
-                 (unsigned long)total_inj,
-                 (unsigned long)q_overflows);
-        kmbox_send_response(resp);
+
+        int n = snprintf(info_buf, sizeof(info_buf),
+                         "KMBOX_VID:%04X\r\n"
+                         "KMBOX_PID:%04X\r\n"
+                         "KMBOX_MFR:%s\r\n"
+                         "KMBOX_PROD:%s\r\n"
+                         "KMBOX_HID:ready=%d,mouse=%d,kbd=%d,itfs=%u\r\n"
+                         "KMBOX_INFO:hmode=%d,imode=%d,max=%d,vel=%d,qd=%d,qc=%d,inj=%lu,ovf=%lu\r\n",
+                         (unsigned)vid,
+                         (unsigned)pid,
+                         (mfr && mfr[0]) ? mfr : "Unknown",
+                         (prod && prod[0]) ? prod : "Unknown",
+                         usb_hid_is_host_ready() ? 1 : 0,
+                         is_mouse_connected() ? 1 : 0,
+                         is_keyboard_connected() ? 1 : 0,
+                         (unsigned)usb_hid_get_mirrored_itf_count(),
+                         (int)smooth_get_humanization_mode(),
+                         (int)smooth_get_inject_mode(),
+                         (int)smooth_get_max_per_frame(),
+                         (int)smooth_get_velocity_matching(),
+                         (int)q_count,
+                         (int)SMOOTH_QUEUE_SIZE,
+                         (unsigned long)total_inj,
+                         (unsigned long)q_overflows);
+        if (n > 0) {
+            size_t send_len = ((size_t)n < sizeof(info_buf)) ? (size_t)n : (sizeof(info_buf) - 1);
+            uart_send_text_reliable((const uint8_t *)info_buf, send_len);
+        }
         return true;
     }
-    
+
     return false;
 }
 

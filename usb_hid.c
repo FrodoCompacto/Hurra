@@ -8,6 +8,7 @@
 #include "lib/kmbox-commands/kmbox_commands.h"
 #include "pico/stdlib.h"
 #include "pico/platform.h"
+#include "pico/critical_section.h"
 #include "hardware/timer.h"     // For time_us_32() in hid_device_task
 #include "kmbox_serial_handler.h" // Include the header for serial handling
 #include "state_management.h"   // Include the header for state management
@@ -24,7 +25,15 @@ uint16_t attached_vid = 0;
 uint16_t attached_pid = 0;
 bool attached_has_serial = false;
 static volatile bool pending_device_reenumeration = false;
+static volatile bool host_hid_ready = false;
 static bool checked_runtime_mouse_override = false;
+static bool force_16bit_desc_override = false;
+
+#define HID_RECEIVE_REARM_INTERVAL_MS   25u
+#define HID_STATUS_POLL_INTERVAL_MS     100u
+#define HID_STATUS_MISSING_DEBOUNCE_MS  250u
+
+static inline void request_device_reenumeration(void);
 
 // Dynamic string descriptor storage
 static char attached_manufacturer[64] = "";
@@ -99,14 +108,18 @@ static void utf16_to_utf8(uint16_t *utf16_buf, size_t utf16_buf_bytes, char *utf
 
 // Function to set the VID and PID of the attached device
 void set_attached_device_vid_pid(uint16_t vid, uint16_t pid) {
-    // Only update and re-enumerate if VID/PID has actually changed
-    if (attached_vid != vid || attached_pid != pid) {
-        attached_vid = vid;
-        attached_pid = pid;
-        attached_has_serial = false; // Default to no serial number unless device has one
-        
-        // Force USB re-enumeration to update descriptor
-        force_usb_reenumeration();
+    bool changed = (attached_vid != vid || attached_pid != pid);
+    attached_vid = vid;
+    attached_pid = pid;
+    if (!string_descriptors_fetched || (vid == 0 && pid == 0)) {
+        attached_has_serial = false;
+    }
+    host_hid_ready = (vid != 0 && pid != 0);
+
+    // CRITICAL: Device stack calls (tud_disconnect / tud_connect) MUST run on Core0.
+    // Host callbacks run on Core1, so schedule re-enumeration for hid_device_task().
+    if (changed || host_hid_ready) {
+        request_device_reenumeration();
     }
 }
 
@@ -135,6 +148,15 @@ void force_usb_reenumeration() {
 static inline void request_device_reenumeration(void) {
     __dmb();
     pending_device_reenumeration = true;
+}
+
+bool usb_hid_is_host_ready(void) {
+    return host_hid_ready;
+}
+
+void usb_hid_clear_pending_reenumeration(void) {
+    pending_device_reenumeration = false;
+    __dmb();
 }
 
 //--------------------------------------------------------------------+
@@ -196,11 +218,14 @@ typedef struct {
     // Runtime state (populated during tuh_hid_mount_cb)
     uint8_t  host_dev_addr;
     uint8_t  host_instance;
-    bool     is_mouse;         // Interface we inject mouse/keyboard/consumer into
+    bool     is_mouse;         // Interface carrying mouse reports
+    bool     is_standard_kbd;  // Interface carrying standard 8-byte 6KRO keyboard reports
+    uint8_t  kbd_report_id;    // Keyboard Report ID on this interface (0 if none)
 
     // HID report descriptor (non-mouse only; mouse uses desc_hid_report_runtime)
     uint8_t  report_desc[MIRROR_ITF_DESC_MAX];
     uint16_t report_desc_len;
+    uint32_t declared_report_ids[8]; // 256-bit mask of Report IDs exposed on device side
 
     bool     active;
 } mirrored_interface_t;
@@ -210,24 +235,51 @@ static uint8_t mirrored_itf_count = 0;      // Active mirrored interfaces
 static uint8_t expected_hid_itf_count = 0;   // Expected from config descriptor
 static uint8_t mounted_hid_itf_count = 0;    // Mounted so far
 
-// Which device-side HID instance carries the composite descriptor (keyboard +
-// mouse + consumer).  All mouse/keyboard/consumer reports must be sent on this
-// instance.  Defaults to 0 for single-interface mode.
+// Device-side HID instance routing:
+// - mouse_device_instance carries mouse reports (e.g. MI_01 on Logitech 046D:C534)
+// - kbd_device_instance carries keyboard reports (e.g. MI_00 on 046D:C534, or
+//   mouse_device_instance when only a single-interface mouse is attached)
 static uint8_t mouse_device_instance = 0;
+static uint8_t kbd_device_instance = 0;
+static uint8_t kbd_device_report_id = REPORT_ID_KEYBOARD;
+static uint8_t active_mouse_report_id = REPORT_ID_MOUSE;
 
+uint8_t usb_hid_get_mirrored_itf_count(void) {
+    return mirrored_itf_count;
+}
+
+#if ENABLE_KMBOX_USB_CONTROL
 // Return the TinyUSB HID instance index for the KMBox control interface.
 // Always the last interface in the config descriptor (after mirrored/default HID).
 static inline uint8_t kmbox_control_instance(void) {
     return (mirrored_itf_count > 0) ? mirrored_itf_count : 1;
 }
+#endif
 
 // Vendor report passthrough queue (Core1 producer → Core0 consumer).
-// When the host mouse sends vendor reports (e.g. Logitech HID++, Razer),
+// When the host mouse sends vendor reports (e.g. Consumer/System Control),
 // Core1 queues them here and Core0 drains them via tud_hid_report().
 #define VENDOR_QUEUE_SIZE 16
 #define VENDOR_QUEUE_MASK (VENDOR_QUEUE_SIZE - 1)
 #define VENDOR_REPORT_MAX_LEN 64
-#define PASSTHROUGH_GET_TIMEOUT_US 80000u
+#define PASSTHROUGH_GET_TIMEOUT_US 5000u
+
+// Spinlock-protected keyboard report queue (Core1 physical + Core0 serial → Core0 USB).
+// Ensures every key-down and key-up transition is delivered in order without
+// ever calling tud_hid_* from Core1 or dropping reports when the endpoint is busy.
+#define KBD_QUEUE_SIZE 32
+#define KBD_QUEUE_MASK (KBD_QUEUE_SIZE - 1)
+
+static critical_section_t g_kbd_lock;
+static bool g_kbd_lock_initialized = false;
+static hid_keyboard_report_t g_phys_kbd_report = {0};
+static hid_keyboard_report_t g_synth_kbd_report = {0};
+static hid_keyboard_report_t g_last_queued_kbd_report = {0};
+static hid_keyboard_report_t g_kbd_queue[KBD_QUEUE_SIZE];
+static volatile uint8_t g_kbd_q_head = 0;
+static volatile uint8_t g_kbd_q_tail = 0;
+static volatile bool g_synth_tap_active = false;
+static volatile uint32_t g_synth_tap_release_us = 0;
 
 typedef struct {
     uint8_t device_instance;  // Which device-side HID instance to send on
@@ -379,14 +431,12 @@ const char* get_attached_product(void) {
     return attached_product;
 }
 
-// Function to get dynamic serial string
-const char* get_dynamic_serial_string() {
-    static char dynamic_serial[64];
-    if (attached_vid && attached_pid) {
-        snprintf(dynamic_serial, sizeof(dynamic_serial), "PIOKMbox_%04X_%04X", attached_vid, attached_pid);
-        return dynamic_serial;
+// Function to get dynamic serial string (only used if explicitly requested)
+const char* get_dynamic_serial_string(void) {
+    if (attached_has_serial && attached_serial[0] != '\0') {
+        return attached_serial;
     }
-    return "PIOKMbox_v1.0";
+    return "";
 }
 
 // Error tracking structure with better organization
@@ -469,9 +519,9 @@ static inline float hid_rng_gaussian(void) {
 // Device management helpers
 static void handle_device_disconnection(uint8_t dev_addr);
 static void handle_hid_device_connection(uint8_t dev_addr, uint8_t itf_protocol);
+static void handle_hid_device_offline(uint8_t dev_addr);
 
 // Report processing helpers
-static bool process_keyboard_report_internal(const hid_keyboard_report_t *report);
 static bool process_mouse_report_internal(const hid_mouse_report_t *report);
 
 // Humanization helpers
@@ -554,6 +604,7 @@ static const uint8_t desc_hid_mouse_16bit[] = {
 static const uint8_t desc_hid_consumer[] = {
     TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(REPORT_ID_CONSUMER_CONTROL))};
 
+#if ENABLE_KMBOX_USB_CONTROL
 // KMBox USB HID Control Interface — dedicated vendor output+feature report
 // for KMBox commands over USB HID (no UART/bridge required).
 //
@@ -588,6 +639,7 @@ static const uint8_t desc_hid_kmbox_control[] = {
 #define KMBOX_USB_PREFIX_0  0xF0
 #define KMBOX_USB_PREFIX_1  0xAA
 #define KMBOX_USB_PREFIX_LEN 2
+#endif
 
 // Static fallback concatenated descriptor (used by config descriptor sizeof)
 const uint8_t desc_hid_report[] = {
@@ -720,6 +772,11 @@ static void reset_device_string_descriptors(void) {
     expected_hid_itf_count = 0;
     mounted_hid_itf_count = 0;
     mouse_device_instance = 0;
+    kbd_device_instance = 0;
+    kbd_device_report_id = REPORT_ID_KEYBOARD;
+    active_mouse_report_id = REPORT_ID_MOUSE;
+    force_16bit_desc_override = false;
+    using_16bit_output_override = false;
     memset(mirrored_itfs, 0, sizeof(mirrored_itfs));
 
     // Reset vendor report queues and GET_REPORT cache
@@ -1130,7 +1187,8 @@ typedef struct {
     uint8_t effective_protocol;  // HID_ITF_PROTOCOL_MOUSE/KEYBOARD/NONE
     bool    has_report_id;
     uint8_t mouse_report_id;     // Report ID for mouse reports (0 if no report IDs)
-    uint8_t keyboard_report_id;  // Report ID for keyboard reports
+    uint8_t keyboard_report_id;  // Report ID for keyboard reports (0 if no report IDs)
+    bool    is_standard_8byte_kbd; // True if Keyboard collection has standard 64-bit 6KRO input
     bool    active;
 } hid_instance_info_t;
 
@@ -1210,21 +1268,170 @@ static uint8_t detect_usage_from_report_descriptor(const uint8_t *desc_report, u
     return detected_protocol;
 }
 
+// Inspect a HID report descriptor for a top-level Keyboard collection and check
+// whether its INPUT fields match the standard 8-byte (64-bit) 6KRO keyboard layout.
+static bool parse_keyboard_report_info(const uint8_t *desc, size_t len,
+                                       bool *out_has_report_id,
+                                       uint8_t *out_kbd_report_id,
+                                       bool *out_is_standard_8byte)
+{
+    if (out_has_report_id) *out_has_report_id = false;
+    if (out_kbd_report_id) *out_kbd_report_id = 0;
+    if (out_is_standard_8byte) *out_is_standard_8byte = false;
+    if (!desc || len < 4) return false;
+
+    bool found_kbd = false;
+    bool in_kbd_collection = false;
+    int collection_depth = 0;
+    int kbd_collection_depth = -1;
+    uint16_t usage_page = 0;
+    uint8_t usage = 0;
+    uint8_t current_report_id = 0;
+    uint8_t kbd_report_id = 0;
+    bool any_report_id = false;
+    uint32_t report_size_bits = 0;
+    uint32_t report_count = 0;
+    uint32_t kbd_input_bits = 0;
+
+    size_t i = 0;
+    while (i < len) {
+        uint8_t item = desc[i];
+        uint8_t item_size = item & 0x03;
+        if (item_size == 3) item_size = 4;
+        if (i + 1 + item_size > len) break;
+
+        uint32_t value = 0;
+        for (uint8_t b = 0; b < item_size; b++) {
+            value |= (uint32_t)desc[i + 1 + b] << (b * 8);
+        }
+        uint8_t item_tag = item & 0xFC;
+
+        switch (item_tag) {
+            case 0x04: // Usage Page (Global)
+                usage_page = (uint16_t)value;
+                break;
+            case 0x08: // Usage (Local)
+                usage = (uint8_t)value;
+                break;
+            case 0x84: // Report ID (Global)
+                current_report_id = (uint8_t)value;
+                if (current_report_id != 0) any_report_id = true;
+                if (in_kbd_collection && kbd_input_bits == 0) {
+                    kbd_report_id = current_report_id;
+                }
+                break;
+            case 0x74: // Report Size (Global)
+                report_size_bits = value;
+                break;
+            case 0x94: // Report Count (Global)
+                report_count = value;
+                break;
+            case 0xA0: // Collection (Main)
+                collection_depth++;
+                if (!found_kbd && collection_depth == 1 &&
+                    usage_page == HID_USAGE_PAGE_DESKTOP &&
+                    usage == HID_USAGE_DESKTOP_KEYBOARD) {
+                    found_kbd = true;
+                    in_kbd_collection = true;
+                    kbd_collection_depth = collection_depth;
+                    kbd_report_id = current_report_id;
+                }
+                usage = 0;
+                break;
+            case 0xC0: // End Collection (Main)
+                if (in_kbd_collection && collection_depth == kbd_collection_depth) {
+                    in_kbd_collection = false;
+                }
+                if (collection_depth > 0) collection_depth--;
+                usage = 0;
+                break;
+            case 0x80: // Input (Main)
+                if (in_kbd_collection &&
+                    (kbd_report_id == 0 || current_report_id == kbd_report_id)) {
+                    kbd_input_bits += report_size_bits * report_count;
+                }
+                usage = 0;
+                break;
+            case 0x90: // Output (Main)
+            case 0xB0: // Feature (Main)
+                usage = 0;
+                break;
+            default:
+                break;
+        }
+        i += 1 + item_size;
+    }
+
+    if (!found_kbd) return false;
+    if (out_has_report_id) *out_has_report_id = any_report_id || (kbd_report_id != 0);
+    if (out_kbd_report_id) *out_kbd_report_id = kbd_report_id;
+    if (out_is_standard_8byte) *out_is_standard_8byte = (kbd_input_bits == 64);
+    return true;
+}
+
+// Check whether a HID report descriptor already contains a top-level Consumer Control collection.
+static bool descriptor_has_consumer_collection(const uint8_t *desc, size_t len)
+{
+    if (!desc || len < 4) return false;
+
+    int collection_depth = 0;
+    uint16_t usage_page = 0;
+    uint8_t usage = 0;
+    size_t i = 0;
+
+    while (i < len) {
+        uint8_t item = desc[i];
+        uint8_t item_size = item & 0x03;
+        if (item_size == 3) item_size = 4;
+        if (i + 1 + item_size > len) break;
+
+        uint32_t value = 0;
+        for (uint8_t b = 0; b < item_size; b++) {
+            value |= (uint32_t)desc[i + 1 + b] << (b * 8);
+        }
+        uint8_t item_tag = item & 0xFC;
+
+        if (item_tag == 0x04) {
+            usage_page = (uint16_t)value;
+        } else if (item_tag == 0x08) {
+            usage = (uint8_t)value;
+        } else if (item_tag == 0xA0) {
+            if (collection_depth == 0 &&
+                usage_page == HID_USAGE_PAGE_CONSUMER &&
+                usage == HID_USAGE_CONSUMER_CONTROL) {
+                return true;
+            }
+            collection_depth++;
+            usage = 0;
+        } else if (item_tag == 0xC0) {
+            if (collection_depth > 0) collection_depth--;
+            usage = 0;
+        } else if (item_tag == 0x80 || item_tag == 0x90 || item_tag == 0xB0) {
+            usage = 0;
+        }
+        i += 1 + item_size;
+    }
+    return false;
+}
+
 // Strip vendor-specific HID collections (Logitech HID++ Report IDs 0x10/0x11,
 // Usage Page >= 0xFF00) from a cloned HID report descriptor.  Including these
-// in the proxy output descriptor causes host drivers to install vendor filters
-// (e.g. Logitech HID++ driver) that fight the proxy for the device.
+// in the proxy output descriptor causes host drivers (e.g. Logitech G HUB) to
+// open HID++ channels and flood control transfers that stall PIO-USB.
 //
-// Walks the descriptor item-by-item.  When entering a top-level Collection
-// under a vendor Usage Page, skips all items until the matching End Collection.
+// Tracks top-level collection boundaries so pre-collection preamble items
+// (Usage Page 0xFF00, Usage, Report ID) are cleanly rewound without leaving
+// dangling items in the output descriptor.
 static size_t strip_vendor_collections(const uint8_t *src, size_t src_len,
                                         uint8_t *dst, size_t dst_max)
 {
     if (!src || src_len == 0 || !dst || dst_max == 0) return 0;
 
     size_t out = 0;
+    size_t top_level_start = 0;
     size_t i = 0;
     uint16_t cur_usage_page = 0;
+    int collection_depth = 0;
     int skip_depth = 0;
 
     while (i < src_len) {
@@ -1235,10 +1442,15 @@ static size_t strip_vendor_collections(const uint8_t *src, size_t src_len,
         if (i + total_len > src_len) break;
 
         uint32_t value = 0;
-        for (uint8_t b = 0; b < item_size; b++)
+        for (uint8_t b = 0; b < item_size; b++) {
             value |= (uint32_t)src[i + 1 + b] << (b * 8);
+        }
 
         uint8_t item_tag = item & 0xFC;
+
+        if (item_tag == 0x04) { // Usage Page (Global) — track even across skipped collections
+            cur_usage_page = (uint16_t)value;
+        }
 
         if (skip_depth > 0) {
             if (item_tag == 0xA0) skip_depth++;
@@ -1247,14 +1459,15 @@ static size_t strip_vendor_collections(const uint8_t *src, size_t src_len,
             continue;
         }
 
-        if (item_tag == 0x04) // Usage Page (Global)
-            cur_usage_page = (uint16_t)value;
-
-        if (item_tag == 0xA0 && cur_usage_page >= 0xFF00) {
-            // Entering vendor collection — skip it entirely
-            skip_depth = 1;
-            i += total_len;
-            continue;
+        if (item_tag == 0xA0) { // Collection
+            if (collection_depth == 0 && cur_usage_page >= 0xFF00) {
+                // Rewind top-level preamble items emitted for this vendor collection
+                out = top_level_start;
+                skip_depth = 1;
+                i += total_len;
+                continue;
+            }
+            collection_depth++;
         }
 
         if (out + total_len <= dst_max) {
@@ -1263,28 +1476,52 @@ static size_t strip_vendor_collections(const uint8_t *src, size_t src_len,
         } else {
             break;
         }
+
+        if (item_tag == 0xC0) { // End Collection
+            if (collection_depth > 0) {
+                collection_depth--;
+                if (collection_depth == 0) {
+                    top_level_start = out;
+                }
+            }
+        }
+
         i += total_len;
+    }
+
+    if (collection_depth == 0 && top_level_start > 0) {
+        out = top_level_start;
     }
     return out;
 }
 
 static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_t mouse_len)
 {
-    // Build the composite HID report descriptor:
-    //   Keyboard (report ID N) + Mouse (report ID M) + Consumer Control (report ID P)
-    //
-    // CRITICAL CONSTRAINT (USB HID §5.6): When ANY top-level collection uses a
-    // Report ID, ALL collections in the descriptor MUST have a Report ID.
-    // Our keyboard and consumer descriptors always have Report IDs, so we MUST
-    // ensure the mouse portion also has one.
-    //
-    // For gaming mice whose descriptors already contain Report IDs, we use the
-    // descriptor as-is and remap keyboard/consumer to avoid conflicts.
-    //
-    // For boot-protocol mice (or mice whose descriptors lack Report IDs), we
-    // inject REPORT_ID_MOUSE (2) into the mouse descriptor so it's valid in the
-    // composite.
-    
+    // Check whether a dedicated standard 8-byte keyboard interface is ALREADY
+    // mirrored on another interface (e.g. MI_00 on Logitech 046D:C534 MK235).
+    // When present, we route all physical + synthetic keyboard reports through
+    // that genuine keyboard interface and do NOT inject duplicate keyboard or
+    // consumer collections into the mouse interface!
+    bool has_dedicated_kbd_itf = false;
+    uint8_t dedicated_kbd_inst = 0;
+    uint8_t dedicated_kbd_rid = 0;
+
+    for (uint8_t i = 0; i < mirrored_itf_count; i++) {
+        if (mirrored_itfs[i].active && !mirrored_itfs[i].is_mouse && mirrored_itfs[i].is_standard_kbd) {
+            has_dedicated_kbd_itf = true;
+            dedicated_kbd_inst = i;
+            dedicated_kbd_rid = mirrored_itfs[i].kbd_report_id;
+            break;
+        }
+    }
+
+    bool mouse_already_has_consumer = (mouse_desc != NULL && mouse_len > 0) &&
+                                      descriptor_has_consumer_collection(mouse_desc, mouse_len);
+
+    bool need_injected_kbd = !has_dedicated_kbd_itf;
+    bool need_injected_consumer = !has_dedicated_kbd_itf && !mouse_already_has_consumer;
+    bool need_composite_injection = need_injected_kbd || need_injected_consumer;
+
     // --- Scan mouse descriptor for existing Report IDs ---
     bool used_ids[256];
     memset(used_ids, 0, sizeof(used_ids));
@@ -1299,16 +1536,15 @@ static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_
         }
     }
     
-    // --- If mouse has no Report IDs, we'll inject REPORT_ID_MOUSE ---
-    // Build a modified copy with Report ID inserted after the first
-    // Collection(Application) tag [0xA1, 0x01].
+    // --- Only inject REPORT_ID_MOUSE into a report-ID-less mouse descriptor
+    // when we are actually combining multiple collections on the mouse interface ---
     uint8_t mouse_desc_patched[HID_DESC_BUF_SIZE];
     size_t mouse_len_patched = 0;
     const uint8_t *mouse_desc_final = mouse_desc;
     size_t mouse_len_final = mouse_len;
+    bool injected_mouse_rid = false;
     
-    if (mouse_desc != NULL && mouse_len > 0 && !mouse_has_report_ids) {
-        // Inject Report ID after first Collection(Application)
+    if (need_composite_injection && mouse_desc != NULL && mouse_len > 0 && !mouse_has_report_ids) {
         bool injected = false;
         size_t dst = 0;
         for (size_t src = 0; src < mouse_len && dst < sizeof(mouse_desc_patched) - 2; src++) {
@@ -1317,10 +1553,8 @@ static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_
             // Look for Collection(Application): 0xA1 0x01
             if (!injected && src + 1 < mouse_len &&
                 mouse_desc[src] == 0xA1 && mouse_desc[src + 1] == 0x01) {
-                // Copy the 0x01 value byte
                 src++;
                 mouse_desc_patched[dst++] = mouse_desc[src];
-                // Inject Report ID(REPORT_ID_MOUSE)
                 mouse_desc_patched[dst++] = 0x85; // Report ID tag
                 mouse_desc_patched[dst++] = REPORT_ID_MOUSE;
                 injected = true;
@@ -1332,114 +1566,121 @@ static void build_runtime_hid_report_with_mouse(const uint8_t *mouse_desc, size_
             mouse_desc_final = mouse_desc_patched;
             mouse_len_final = mouse_len_patched;
             used_ids[REPORT_ID_MOUSE] = true;
+            injected_mouse_rid = true;
         }
     }
     
-    // --- Determine safe Report IDs for keyboard and consumer ---
+    // --- Determine safe Report IDs for fallback keyboard and consumer ---
     uint8_t kbd_report_id = REPORT_ID_KEYBOARD;      // default 1
     uint8_t consumer_report_id = REPORT_ID_CONSUMER_CONTROL; // default 3
     
-    // If default keyboard ID conflicts, find an unused one starting from 0x10
     if (used_ids[kbd_report_id]) {
         for (uint8_t id = 0x10; id < 0xFE; id++) {
             if (!used_ids[id]) { kbd_report_id = id; break; }
         }
     }
-    used_ids[kbd_report_id] = true; // Mark it used
+    used_ids[kbd_report_id] = true;
     
-    // Same for consumer
     if (used_ids[consumer_report_id]) {
         for (uint8_t id = 0x11; id < 0xFE; id++) {
             if (!used_ids[id]) { consumer_report_id = id; break; }
         }
     }
     
-    // Build remapped keyboard and consumer descriptors
-    uint8_t kbd_desc[sizeof(desc_hid_keyboard)];
-    memcpy(kbd_desc, desc_hid_keyboard, sizeof(desc_hid_keyboard));
-    for (size_t i = 0; i + 1 < sizeof(kbd_desc); i++) {
-        if (kbd_desc[i] == 0x85 && kbd_desc[i+1] == REPORT_ID_KEYBOARD) {
-            kbd_desc[i+1] = kbd_report_id;
-            break;
-        }
-    }
-    
-    uint8_t consumer_desc[sizeof(desc_hid_consumer)];
-    memcpy(consumer_desc, desc_hid_consumer, sizeof(desc_hid_consumer));
-    for (size_t i = 0; i + 1 < sizeof(consumer_desc); i++) {
-        if (consumer_desc[i] == 0x85 && consumer_desc[i+1] == REPORT_ID_CONSUMER_CONTROL) {
-            consumer_desc[i+1] = consumer_report_id;
-            break;
-        }
-    }
-    
     size_t pos = 0;
 
-    // Copy keyboard descriptor
-    if (pos + sizeof(kbd_desc) >= HID_DESC_BUF_SIZE)
-        return;
-    memcpy(&desc_hid_report_runtime[pos], kbd_desc, sizeof(kbd_desc));
-    pos += sizeof(kbd_desc);
+    if (need_injected_kbd) {
+        uint8_t kbd_desc[sizeof(desc_hid_keyboard)];
+        memcpy(kbd_desc, desc_hid_keyboard, sizeof(desc_hid_keyboard));
+        for (size_t i = 0; i + 1 < sizeof(kbd_desc); i++) {
+            if (kbd_desc[i] == 0x85 && kbd_desc[i + 1] == REPORT_ID_KEYBOARD) {
+                kbd_desc[i + 1] = kbd_report_id;
+                break;
+            }
+        }
+        if (pos + sizeof(kbd_desc) >= HID_DESC_BUF_SIZE)
+            return;
+        memcpy(&desc_hid_report_runtime[pos], kbd_desc, sizeof(kbd_desc));
+        pos += sizeof(kbd_desc);
+    }
 
-    // Copy mouse descriptor (possibly patched with injected Report ID)
+    // Copy mouse descriptor
     if (mouse_desc_final != NULL && mouse_len_final > 0)
     {
-        // CRITICAL FIX: For 16-bit gaming mice (G703, G Pro Wireless, etc.),
-        // macOS may expose an 8-bit HID descriptor even though the mouse reports
-        // 16-bit X/Y values. If we clone the 8-bit descriptor, the 16-bit reports
-        // get truncated. Solution: If the parsed layout shows 16-bit X/Y fields,
-        // override the cloned descriptor with our own 16-bit descriptor.
-        bool use_16bit_override = (host_mouse_layout.valid && 
-                                   host_mouse_layout.x_bits == 16 && 
-                                   host_mouse_layout.y_bits == 16);
-        
-        if (use_16bit_override) {
-            // Use our 16-bit mouse descriptor instead of the cloned 8-bit one
+        // Only replace the cloned mouse descriptor with desc_hid_mouse_16bit
+        // when we detected a broken 8-bit OS descriptor on a 16-bit mouse
+        // (force_16bit_desc_override), NOT when the real descriptor already
+        // natively describes its own 12-bit or 16-bit fields!
+        if (force_16bit_desc_override) {
             size_t dlen = sizeof(desc_hid_mouse_16bit);
             if (pos + dlen >= HID_DESC_BUF_SIZE)
                 return;
             memcpy(&desc_hid_report_runtime[pos], desc_hid_mouse_16bit, dlen);
             pos += dlen;
             using_16bit_output_override = true;
+            active_mouse_report_id = REPORT_ID_MOUSE;
         } else {
-            // Use the cloned descriptor from the host mouse
             if (pos + mouse_len_final >= HID_DESC_BUF_SIZE)
                 return;
             memcpy(&desc_hid_report_runtime[pos], mouse_desc_final, mouse_len_final);
             pos += mouse_len_final;
             using_16bit_output_override = false;
+            if (host_mouse_layout.valid && host_mouse_layout.has_report_id) {
+                active_mouse_report_id = host_mouse_layout.mouse_report_id;
+            } else if (mouse_has_report_ids) {
+                active_mouse_report_id = host_mouse_report_id;
+            } else if (injected_mouse_rid) {
+                active_mouse_report_id = REPORT_ID_MOUSE;
+            } else {
+                active_mouse_report_id = 0;
+            }
         }
     }
     else
     {
-        // Fallback: Use 16-bit mouse descriptor for Lightspeed and other high-res mice
-        // This path is triggered when host_mouse_desc_len == 0 (e.g., Logitech Lightspeed)
+        // Fallback when no physical mouse descriptor is present yet
         size_t dlen = sizeof(desc_hid_mouse_16bit);
         if (pos + dlen >= HID_DESC_BUF_SIZE)
             return;
         memcpy(&desc_hid_report_runtime[pos], desc_hid_mouse_16bit, dlen);
         pos += dlen;
         using_16bit_output_override = true;
+        active_mouse_report_id = REPORT_ID_MOUSE;
     }
 
-    // Copy consumer control descriptor
-    if (pos + sizeof(consumer_desc) >= HID_DESC_BUF_SIZE)
-        return;
-    memcpy(&desc_hid_report_runtime[pos], consumer_desc, sizeof(consumer_desc));
-    pos += sizeof(consumer_desc);
+    if (need_injected_consumer) {
+        uint8_t consumer_desc[sizeof(desc_hid_consumer)];
+        memcpy(consumer_desc, desc_hid_consumer, sizeof(desc_hid_consumer));
+        for (size_t i = 0; i + 1 < sizeof(consumer_desc); i++) {
+            if (consumer_desc[i] == 0x85 && consumer_desc[i + 1] == REPORT_ID_CONSUMER_CONTROL) {
+                consumer_desc[i + 1] = consumer_report_id;
+                break;
+            }
+        }
+        if (pos + sizeof(consumer_desc) >= HID_DESC_BUF_SIZE)
+            return;
+        memcpy(&desc_hid_report_runtime[pos], consumer_desc, sizeof(consumer_desc));
+        pos += sizeof(consumer_desc);
+    }
 
     // Zero-fill remainder
     if (pos < HID_DESC_BUF_SIZE) {
         memset(&desc_hid_report_runtime[pos], 0, HID_DESC_BUF_SIZE - pos);
     }
 
-    // Set actual content length so host reads only valid descriptor data
     desc_hid_runtime_len = pos;
     desc_hid_runtime_valid = true;
     
-    // Store the runtime IDs for use by all report-sending paths
     runtime_kbd_report_id = kbd_report_id;
     runtime_consumer_report_id = consumer_report_id;
+
+    if (has_dedicated_kbd_itf) {
+        kbd_device_instance = dedicated_kbd_inst;
+        kbd_device_report_id = dedicated_kbd_rid;
+    } else {
+        kbd_device_instance = mouse_device_instance;
+        kbd_device_report_id = runtime_kbd_report_id;
+    }
 }
 
 bool usb_hid_init(void)
@@ -1452,6 +1693,19 @@ bool usb_hid_init(void)
 
     // Initialize connection state
     memset(&connection_state, 0, sizeof(connection_state));
+    host_hid_ready = false;
+    pending_device_reenumeration = false;
+
+    if (!g_kbd_lock_initialized) {
+        critical_section_init(&g_kbd_lock);
+        g_kbd_lock_initialized = true;
+    }
+    memset(&g_phys_kbd_report, 0, sizeof(g_phys_kbd_report));
+    memset(&g_synth_kbd_report, 0, sizeof(g_synth_kbd_report));
+    memset(&g_last_queued_kbd_report, 0, sizeof(g_last_queued_kbd_report));
+    g_kbd_q_head = 0;
+    g_kbd_q_tail = 0;
+    g_synth_tap_active = false;
 
     // Initialize per-instance HID tracking
     memset(hid_instances, 0, sizeof(hid_instances));
@@ -1462,6 +1716,10 @@ bool usb_hid_init(void)
     expected_hid_itf_count = 0;
     mounted_hid_itf_count = 0;
     mouse_device_instance = 0;
+    kbd_device_instance = 0;
+    kbd_device_report_id = REPORT_ID_KEYBOARD;
+    active_mouse_report_id = REPORT_ID_MOUSE;
+    force_16bit_desc_override = false;
     vendor_fwd_queue.head = vendor_fwd_queue.tail = 0;
     set_report_queue.head = set_report_queue.tail = 0;
     memset(report_cache, 0, sizeof(report_cache));
@@ -1574,32 +1832,93 @@ static void handle_hid_device_connection(uint8_t dev_addr, uint8_t itf_protocol)
     neopixel_update_status();
 }
 
-static bool __not_in_flash_func(process_keyboard_report_internal)(const hid_keyboard_report_t *report)
+// Merge physical + synthetic keyboard states and push to g_kbd_queue.
+// Caller MUST hold g_kbd_lock.
+static void __not_in_flash_func(merge_and_enqueue_kbd_locked)(bool force_enqueue)
 {
-    if (report == NULL)
-    {
-        return false;
+    hid_keyboard_report_t merged;
+    memset(&merged, 0, sizeof(merged));
+    merged.modifier = g_phys_kbd_report.modifier | g_synth_kbd_report.modifier;
+
+    uint8_t n = 0;
+    for (int i = 0; i < HID_KEYBOARD_KEYCODE_COUNT && n < HID_KEYBOARD_KEYCODE_COUNT; i++) {
+        uint8_t kc = g_phys_kbd_report.keycode[i];
+        if (kc == 0) continue;
+        bool dup = false;
+        for (uint8_t j = 0; j < n; j++) {
+            if (merged.keycode[j] == kc) { dup = true; break; }
+        }
+        if (!dup) merged.keycode[n++] = kc;
+    }
+    for (int i = 0; i < HID_KEYBOARD_KEYCODE_COUNT && n < HID_KEYBOARD_KEYCODE_COUNT; i++) {
+        uint8_t kc = g_synth_kbd_report.keycode[i];
+        if (kc == 0) continue;
+        bool dup = false;
+        for (uint8_t j = 0; j < n; j++) {
+            if (merged.keycode[j] == kc) { dup = true; break; }
+        }
+        if (!dup) merged.keycode[n++] = kc;
     }
 
-    // CRITICAL FIX: Check readiness before attempting to send
-    // If endpoint is busy, return true anyway to avoid blocking the HID report pipeline
-    // The keyboard state will be sent with the next available opportunity
-    if (!tud_hid_n_ready(mouse_device_instance))
-    {
-        return true;  // Endpoint busy, continue processing without blocking
+    if (!force_enqueue && memcmp(&merged, &g_last_queued_kbd_report, sizeof(merged)) == 0) {
+        return;
+    }
+    g_last_queued_kbd_report = merged;
+
+    uint8_t next_head = (g_kbd_q_head + 1) & KBD_QUEUE_MASK;
+    if (next_head == g_kbd_q_tail) {
+        // Queue full: coalesce into newest slot so final key-up state is never lost
+        uint8_t last_idx = (g_kbd_q_head - 1) & KBD_QUEUE_MASK;
+        g_kbd_queue[last_idx] = merged;
+    } else {
+        g_kbd_queue[g_kbd_q_head] = merged;
+        g_kbd_q_head = next_head;
+    }
+}
+
+static void __not_in_flash_func(handle_physical_kbd_report)(const hid_keyboard_report_t *report)
+{
+    if (report == NULL || !g_kbd_lock_initialized) return;
+
+    static uint32_t activity_counter = 0;
+    if ((++activity_counter & KEYBOARD_ACTIVITY_MASK) == 0) {
+        neopixel_trigger_activity_flash_color(COLOR_KEYBOARD_ACTIVITY);
     }
 
-    // Fast path: send report immediately if endpoint is ready
-    bool success = tud_hid_n_report(mouse_device_instance, runtime_kbd_report_id, report, sizeof(hid_keyboard_report_t));
-    if (success)
-    {
-        // Skip error counter reset for performance
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+    critical_section_enter_blocking(&g_kbd_lock);
+    g_phys_kbd_report = *report;
+    merge_and_enqueue_kbd_locked(false);
+    critical_section_exit(&g_kbd_lock);
+}
+
+static void handle_physical_kbd_disconnect(void)
+{
+    if (!g_kbd_lock_initialized) return;
+    critical_section_enter_blocking(&g_kbd_lock);
+    memset(&g_phys_kbd_report, 0, sizeof(g_phys_kbd_report));
+    merge_and_enqueue_kbd_locked(false);
+    critical_section_exit(&g_kbd_lock);
+}
+
+static void handle_hid_device_offline(uint8_t dev_addr)
+{
+    handle_physical_kbd_disconnect();
+    kmbox_update_physical_buttons(0);
+    free_hid_instances_for_device(dev_addr);
+    handle_device_disconnection(dev_addr);
+
+    attached_vid = 0;
+    attached_pid = 0;
+    host_hid_ready = false;
+    checked_runtime_mouse_override = false;
+    force_16bit_desc_override = false;
+    using_16bit_output_override = false;
+    reset_device_string_descriptors();
+    request_device_reenumeration();
+
+    neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
+    neopixel_update_status();
+    kmbox_send_status("HID device disconnected");
 }
 
 // Helper: write a signed axis value into a raw report buffer at an arbitrary
@@ -1617,15 +1936,16 @@ static inline void __not_in_flash_func(write_axis_bits)(uint8_t *buf, uint8_t bu
         if (cv > max_val) cv = max_val;
         if (cv < min_val) cv = min_val;
         uint32_t uval = (uint32_t)cv & ((1u << nbits) - 1);
-        if (start_byte + 2 < buf_len) {
+        uint8_t end_byte = start_byte + (uint8_t)((bit_in_byte + nbits - 1) / 8);
+        if (end_byte < buf_len) {
             uint32_t mask = ((1u << nbits) - 1) << bit_in_byte;
-            uint32_t raw32 = (uint32_t)buf[start_byte]
-                           | ((uint32_t)buf[start_byte + 1] << 8)
-                           | ((uint32_t)buf[start_byte + 2] << 16);
+            uint32_t raw32 = (uint32_t)buf[start_byte];
+            if (start_byte + 1 < buf_len) raw32 |= ((uint32_t)buf[start_byte + 1] << 8);
+            if (start_byte + 2 < buf_len) raw32 |= ((uint32_t)buf[start_byte + 2] << 16);
             raw32 = (raw32 & ~mask) | ((uval << bit_in_byte) & mask);
-            buf[start_byte]     = (uint8_t)(raw32 & 0xFF);
-            buf[start_byte + 1] = (uint8_t)((raw32 >> 8) & 0xFF);
-            buf[start_byte + 2] = (uint8_t)((raw32 >> 16) & 0xFF);
+            buf[start_byte] = (uint8_t)(raw32 & 0xFF);
+            if (start_byte + 1 <= end_byte) buf[start_byte + 1] = (uint8_t)((raw32 >> 8) & 0xFF);
+            if (start_byte + 2 <= end_byte) buf[start_byte + 2] = (uint8_t)((raw32 >> 16) & 0xFF);
         }
     } else if (is_16bit) {
         if (start_byte + 1 < buf_len) {
@@ -1857,9 +2177,9 @@ static bool __not_in_flash_func(process_mouse_report_internal)(const hid_mouse_r
 
 void __not_in_flash_func(process_kbd_report)(const hid_keyboard_report_t *report)
 {
-    if (report == NULL)
+    if (report == NULL || !g_kbd_lock_initialized)
     {
-        return; // Fast fail without printf for performance
+        return;
     }
 
     static uint32_t activity_counter = 0;
@@ -1868,10 +2188,152 @@ void __not_in_flash_func(process_kbd_report)(const hid_keyboard_report_t *report
         neopixel_trigger_activity_flash_color(COLOR_KEYBOARD_ACTIVITY);
     }
 
-    // Fast forward the report
-    if (process_keyboard_report_internal(report))
-    {
-        // Report processed successfully
+    critical_section_enter_blocking(&g_kbd_lock);
+    g_synth_tap_active = false;
+    g_synth_kbd_report = *report;
+    merge_and_enqueue_kbd_locked(false);
+    critical_section_exit(&g_kbd_lock);
+}
+
+void kmbox_keyboard_tap(uint8_t modifiers, const uint8_t keycodes[6], uint16_t hold_ms)
+{
+    if (!g_kbd_lock_initialized) return;
+
+    uint16_t dur_ms = hold_ms;
+    if (dur_ms == 0) {
+        dur_ms = (uint16_t)(40u + (hid_rng_next() % 25u)); // 40..64ms natural tap
+    }
+    if (dur_ms < 15u) dur_ms = 15u;
+    if (dur_ms > 2000u) dur_ms = 2000u;
+
+    critical_section_enter_blocking(&g_kbd_lock);
+    if (g_synth_tap_active) {
+        // Flush an explicit release before starting the next tap so repeated
+        // taps of the same key always produce distinct keystrokes.
+        memset(&g_synth_kbd_report, 0, sizeof(g_synth_kbd_report));
+        merge_and_enqueue_kbd_locked(false);
+    }
+
+    memset(&g_synth_kbd_report, 0, sizeof(g_synth_kbd_report));
+    g_synth_kbd_report.modifier = modifiers;
+    if (keycodes != NULL) {
+        memcpy(g_synth_kbd_report.keycode, keycodes, HID_KEYBOARD_KEYCODE_COUNT);
+    }
+    merge_and_enqueue_kbd_locked(false);
+    g_synth_tap_release_us = time_us_32() + ((uint32_t)dur_ms * 1000u);
+    g_synth_tap_active = true;
+    critical_section_exit(&g_kbd_lock);
+}
+
+void kmbox_keyboard_key_down(uint8_t modifiers, uint8_t keycode)
+{
+    if (!g_kbd_lock_initialized) return;
+
+    critical_section_enter_blocking(&g_kbd_lock);
+    g_synth_tap_active = false;
+    g_synth_kbd_report.modifier |= modifiers;
+    if (keycode != 0) {
+        bool exists = false;
+        int empty_slot = -1;
+        for (int i = 0; i < HID_KEYBOARD_KEYCODE_COUNT; i++) {
+            if (g_synth_kbd_report.keycode[i] == keycode) { exists = true; break; }
+            if (g_synth_kbd_report.keycode[i] == 0 && empty_slot < 0) empty_slot = i;
+        }
+        if (!exists && empty_slot >= 0) {
+            g_synth_kbd_report.keycode[empty_slot] = keycode;
+        }
+    }
+    merge_and_enqueue_kbd_locked(false);
+    critical_section_exit(&g_kbd_lock);
+}
+
+void kmbox_keyboard_key_up(uint8_t modifiers, uint8_t keycode)
+{
+    if (!g_kbd_lock_initialized) return;
+
+    critical_section_enter_blocking(&g_kbd_lock);
+    g_synth_tap_active = false;
+    g_synth_kbd_report.modifier &= (uint8_t)~modifiers;
+    if (keycode != 0) {
+        uint8_t compact[HID_KEYBOARD_KEYCODE_COUNT] = {0};
+        uint8_t w = 0;
+        for (int i = 0; i < HID_KEYBOARD_KEYCODE_COUNT; i++) {
+            uint8_t kc = g_synth_kbd_report.keycode[i];
+            if (kc != 0 && kc != keycode) {
+                compact[w++] = kc;
+            }
+        }
+        memcpy(g_synth_kbd_report.keycode, compact, HID_KEYBOARD_KEYCODE_COUNT);
+    } else if (modifiers == 0) {
+        memset(&g_synth_kbd_report, 0, sizeof(g_synth_kbd_report));
+    }
+    merge_and_enqueue_kbd_locked(false);
+    critical_section_exit(&g_kbd_lock);
+}
+
+void kmbox_keyboard_release_all(void)
+{
+    if (!g_kbd_lock_initialized) return;
+
+    critical_section_enter_blocking(&g_kbd_lock);
+    g_synth_tap_active = false;
+    memset(&g_synth_kbd_report, 0, sizeof(g_synth_kbd_report));
+    merge_and_enqueue_kbd_locked(false);
+    critical_section_exit(&g_kbd_lock);
+}
+
+// Drain queued keyboard and consumer/system reports on Core0 when endpoints are ready.
+static void __not_in_flash_func(drain_auxiliary_hid_queues)(void)
+{
+    if (g_synth_tap_active && (int32_t)(time_us_32() - g_synth_tap_release_us) >= 0) {
+        critical_section_enter_blocking(&g_kbd_lock);
+        if (g_synth_tap_active && (int32_t)(time_us_32() - g_synth_tap_release_us) >= 0) {
+            memset(&g_synth_kbd_report, 0, sizeof(g_synth_kbd_report));
+            g_synth_tap_active = false;
+            merge_and_enqueue_kbd_locked(false);
+        }
+        critical_section_exit(&g_kbd_lock);
+    }
+
+    if (g_kbd_q_tail != g_kbd_q_head &&
+        kbd_device_instance < CFG_TUD_HID &&
+        tud_hid_n_ready(kbd_device_instance)) {
+        hid_keyboard_report_t out_rep;
+        bool has_item = false;
+
+        critical_section_enter_blocking(&g_kbd_lock);
+        if (g_kbd_q_tail != g_kbd_q_head) {
+            out_rep = g_kbd_queue[g_kbd_q_tail];
+            has_item = true;
+        }
+        critical_section_exit(&g_kbd_lock);
+
+        if (has_item && tud_hid_n_report(kbd_device_instance, kbd_device_report_id,
+                                         &out_rep, sizeof(hid_keyboard_report_t))) {
+            critical_section_enter_blocking(&g_kbd_lock);
+            if (g_kbd_q_tail != g_kbd_q_head) {
+                g_kbd_q_tail = (g_kbd_q_tail + 1) & KBD_QUEUE_MASK;
+            }
+            critical_section_exit(&g_kbd_lock);
+        }
+    }
+
+    while (vendor_fwd_queue.tail != vendor_fwd_queue.head) {
+        vendor_report_entry_t *e = &vendor_fwd_queue.entries[vendor_fwd_queue.tail];
+        if (e->device_instance >= CFG_TUD_HID) {
+            __dmb();
+            vendor_fwd_queue.tail = (vendor_fwd_queue.tail + 1) & VENDOR_QUEUE_MASK;
+            continue;
+        }
+        if (!tud_hid_n_ready(e->device_instance)) {
+            break; // Endpoint busy — preserve queued report for next ready poll
+        }
+        if (tud_hid_n_report(e->device_instance, e->report_id, e->data, e->len)) {
+            __dmb();
+            vendor_fwd_queue.tail = (vendor_fwd_queue.tail + 1) & VENDOR_QUEUE_MASK;
+        } else {
+            break;
+        }
     }
 }
 
@@ -1931,6 +2393,32 @@ void hid_device_task(void)
         return;
     }
 
+    // Remote wakeup handling — wake on button press OR pending mouse/keyboard data.
+    if (tud_suspended())
+    {
+        bool has_data = smooth_has_pending() ||
+                        kmbox_has_pending_movement() ||
+                        (g_kbd_q_tail != g_kbd_q_head) ||
+                        (vendor_fwd_queue.tail != vendor_fwd_queue.head);
+        #if PIN_BUTTON != 255
+        has_data = has_data || !gpio_get(PIN_BUTTON);
+        #endif
+        if (has_data) {
+            tud_remote_wakeup();
+        }
+        return;
+    }
+
+    // Only send reports when USB device is properly mounted and ready
+    if (!tud_mounted() || !tud_ready())
+    {
+        return;
+    }
+
+    // Always service keyboard and auxiliary (consumer/system) queues immediately
+    // whenever USB is ready — independent of mouse polling jitter or mouse returns.
+    drain_auxiliary_hid_queues();
+
     // Use cheap microsecond timer for polling with optional jitter.
     // Real mice have crystal/scheduling jitter; perfectly regular 1ms is detectable.
     static uint32_t start_us = 0;
@@ -1956,28 +2444,6 @@ void hid_device_task(void)
         }
     }
     start_us = current_us;
-
-    // Remote wakeup handling — wake on button press OR pending injection data.
-    // Without this, USB suspend blocks all smooth injection output until the
-    // physical mouse moves (which prevents suspend in the first place).
-    if (tud_suspended())
-    {
-        bool has_data = smooth_has_pending() ||
-                        kmbox_has_pending_movement();
-        #if PIN_BUTTON != 255
-        has_data = has_data || !gpio_get(PIN_BUTTON);
-        #endif
-        if (has_data) {
-            tud_remote_wakeup();
-        }
-        return;
-    }
-
-    // Only send reports when USB device is properly mounted and ready
-    if (!tud_mounted() || !tud_ready())
-    {
-        return;
-    }
 
     // --- Track last-sent button state for change detection ---
     // Real mice send a report immediately on button state changes.
@@ -2079,8 +2545,7 @@ void hid_device_task(void)
                 build_raw_mouse_report(raw, sz, &host_mouse_layout,
                                        buttons, x, y, wheel, pan);
 
-                uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
-                tud_hid_n_report(mouse_device_instance, rid, raw, sz);
+                tud_hid_n_report(mouse_device_instance, active_mouse_report_id, raw, sz);
             } else {
                 // Clamp to int8 for standard HID mouse report
                 int8_t cx = (x > 127) ? 127 : ((x < -128) ? -128 : (int8_t)x);
@@ -2126,8 +2591,7 @@ check_idle:
             build_raw_mouse_report(raw, sz, &host_mouse_layout,
                                    current_buttons, 0, 0, 0, 0);
 
-            uint8_t rid = host_mouse_layout.has_report_id ? host_mouse_layout.mouse_report_id : REPORT_ID_MOUSE;
-            tud_hid_n_report(mouse_device_instance, rid, raw, sz);
+            tud_hid_n_report(mouse_device_instance, active_mouse_report_id, raw, sz);
         } else {
             tud_hid_n_mouse_report(mouse_device_instance, REPORT_ID_MOUSE, current_buttons, 0, 0, 0, 0);
         }
@@ -2147,19 +2611,6 @@ check_idle:
     if (!connection_state.mouse_connected && !connection_state.keyboard_connected)
     {
         send_hid_report(REPORT_ID_MOUSE);
-    }
-
-    // --- Drain vendor report queue (Core1 → Core0 passthrough) ---
-    // Forward vendor/non-mouse reports from the host device to the downstream PC.
-    // This enables software like Logitech G Hub / Razer Synapse to communicate
-    // through the proxy for battery status, DPI changes, lighting, etc.
-    while (vendor_fwd_queue.tail != vendor_fwd_queue.head) {
-        vendor_report_entry_t *e = &vendor_fwd_queue.entries[vendor_fwd_queue.tail];
-        if (e->device_instance < CFG_TUD_HID && tud_hid_n_ready(e->device_instance)) {
-            tud_hid_n_report(e->device_instance, e->report_id, e->data, e->len);
-        }
-        __dmb();
-        vendor_fwd_queue.tail = (vendor_fwd_queue.tail + 1) & VENDOR_QUEUE_MASK;
     }
 }
 
@@ -2189,11 +2640,11 @@ void send_hid_report(uint8_t report_id)
         if (!connection_state.keyboard_connected)
         {
             // Check device readiness before each report
-            if (tud_hid_n_ready(mouse_device_instance))
+            if (kbd_device_instance < CFG_TUD_HID && tud_hid_n_ready(kbd_device_instance))
             {
                 // Use static array to avoid stack allocation overhead
                 static const uint8_t empty_keycode[HID_KEYBOARD_KEYCODE_COUNT] = {0};
-                tud_hid_n_keyboard_report(mouse_device_instance, runtime_kbd_report_id, 0, empty_keycode);
+                tud_hid_n_keyboard_report(kbd_device_instance, kbd_device_report_id, 0, empty_keycode);
             }
         }
         break;
@@ -2247,17 +2698,85 @@ void send_hid_report(uint8_t report_id)
     }
 }
 
+static void poll_hid_host_health(void)
+{
+    static uint32_t last_rearm_ms = 0;
+    static uint32_t last_status_poll_ms = 0;
+    static uint32_t hid_missing_since_ms = 0;
+
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    // 1. Periodic IN-endpoint keepalive / self-healing (every 25ms):
+    // If PIO-USB aborted an interrupt IN transfer after 3 transient retries
+    // (XFER_RESULT_FAILED), TinyUSB drops it silently without calling
+    // tuh_hid_report_received_cb. Calling tuh_hid_receive_report() here is a
+    // fast no-op when an IN transfer is still armed, and transparently re-arms
+    // any dead IN pipe within 25ms!
+    if ((now - last_rearm_ms) >= HID_RECEIVE_REARM_INTERVAL_MS) {
+        last_rearm_ms = now;
+        for (int i = 0; i < MAX_HID_INSTANCES; i++) {
+            if (hid_instances[i].active &&
+                tuh_hid_mounted(hid_instances[i].dev_addr, hid_instances[i].instance)) {
+                (void)tuh_hid_receive_report(hid_instances[i].dev_addr, hid_instances[i].instance);
+            }
+        }
+    }
+
+    // 2. Disconnect detection (every 100ms with 250ms debounce):
+    uint8_t dev_addr = cloned_dev_addr;
+    if (dev_addr == 0) {
+        dev_addr = connection_state.mouse_dev_addr ? connection_state.mouse_dev_addr
+                                                   : connection_state.keyboard_dev_addr;
+    }
+    if (dev_addr == 0) {
+        hid_missing_since_ms = 0;
+        return;
+    }
+
+    if ((now - last_status_poll_ms) < HID_STATUS_POLL_INTERVAL_MS) {
+        return;
+    }
+    last_status_poll_ms = now;
+
+    bool missing = !tuh_mounted(dev_addr);
+    for (uint8_t i = 0; i < mirrored_itf_count && !missing; i++) {
+        if (mirrored_itfs[i].active &&
+            !tuh_hid_mounted(mirrored_itfs[i].host_dev_addr, mirrored_itfs[i].host_instance)) {
+            dev_addr = mirrored_itfs[i].host_dev_addr;
+            missing = true;
+        }
+    }
+
+    if (!missing) {
+        hid_missing_since_ms = 0;
+        return;
+    }
+
+    if (hid_missing_since_ms == 0) {
+        hid_missing_since_ms = now;
+        return;
+    }
+
+    if ((now - hid_missing_since_ms) >= HID_STATUS_MISSING_DEBOUNCE_MS) {
+        hid_missing_since_ms = 0;
+        handle_hid_device_offline(dev_addr);
+    }
+}
+
 void hid_host_task(void)
 {
+    poll_hid_host_health();
+
     // Drain SET_REPORT passthrough queue (Core0 → Core1).
-    // Forward vendor SET_REPORT requests from the downstream PC to the real mouse.
     // Process at most 1 per call — tuh_hid_set_report() may block on USB
     // control transfer, and draining the full queue could stall Core1's PIO USB.
     if (set_report_queue.tail != set_report_queue.head) {
         set_report_entry_t *e = &set_report_queue.entries[set_report_queue.tail];
-        tuh_hid_set_report(e->host_dev_addr, e->host_instance,
-                           e->report_id, e->report_type,
-                           (void*)e->data, e->len);
+        if (tuh_hid_mounted(e->host_dev_addr, e->host_instance)) {
+            tuh_hid_set_report(e->host_dev_addr, e->host_instance,
+                               e->report_id, e->report_type,
+                               (void*)e->data, e->len);
+        }
         __dmb();
         set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
     }
@@ -2269,12 +2788,15 @@ void hid_host_task(void)
         get_report_bridge.busy = true;
         __dmb();
 
-        bool started = tuh_hid_get_report(get_report_bridge.host_dev_addr,
-                                          get_report_bridge.host_instance,
-                                          get_report_bridge.report_id,
-                                          get_report_bridge.report_type,
-                                          get_report_bridge.data,
-                                          get_report_bridge.request_len);
+        bool started = false;
+        if (tuh_hid_mounted(get_report_bridge.host_dev_addr, get_report_bridge.host_instance)) {
+            started = tuh_hid_get_report(get_report_bridge.host_dev_addr,
+                                         get_report_bridge.host_instance,
+                                         get_report_bridge.report_id,
+                                         get_report_bridge.report_type,
+                                         get_report_bridge.data,
+                                         get_report_bridge.request_len);
+        }
         if (!started) {
             get_report_bridge.busy = false;
             get_report_bridge.done = true;
@@ -2322,9 +2844,18 @@ void tuh_mount_cb(uint8_t dev_addr)
 
 void tuh_umount_cb(uint8_t dev_addr)
 {
-
-    // Handle device disconnection
-    handle_device_disconnection(dev_addr);
+    if (dev_addr == cloned_dev_addr ||
+        (cloned_dev_addr == 0 &&
+         (dev_addr == connection_state.mouse_dev_addr ||
+          dev_addr == connection_state.keyboard_dev_addr))) {
+        handle_hid_device_offline(dev_addr);
+    } else {
+        if (dev_addr == connection_state.keyboard_dev_addr) {
+            handle_physical_kbd_disconnect();
+        }
+        free_hid_instances_for_device(dev_addr);
+        handle_device_disconnection(dev_addr);
+    }
 
     static uint32_t last_unmount_time = 0;
     uint32_t current_time = to_ms_since_boot(get_absolute_time());
@@ -2340,17 +2871,84 @@ void tuh_umount_cb(uint8_t dev_addr)
         usb_error_tracker.consecutive_host_errors = 0;
     }
     last_unmount_time = current_time;
-
-    // Trigger visual feedback
-    neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
-    neopixel_update_status();
 }
 
 // HID host callbacks — multi-interface mirroring with vendor report passthrough
+static void populate_declared_report_ids(const uint8_t *desc, uint16_t desc_len, uint32_t mask[8])
+{
+    memset(mask, 0, sizeof(uint32_t) * 8);
+    if (desc == NULL || desc_len == 0) {
+        mask[0] |= 1u;
+        return;
+    }
+
+    bool any_rid = false;
+    size_t i = 0;
+    while (i < desc_len) {
+        uint8_t prefix = desc[i];
+        if (prefix == 0xFE) {
+            if (i + 1 >= desc_len) break;
+            i += (size_t)3 + desc[i + 1];
+            continue;
+        }
+        uint8_t bSize = prefix & 0x03;
+        uint8_t data_len = (bSize == 3) ? 4 : bSize;
+        uint8_t tag_type = prefix & 0xFC;
+        if (i + 1 + data_len > desc_len) break;
+
+        if (tag_type == 0x84 && data_len >= 1) { // Report ID (Global)
+            uint8_t rid = desc[i + 1];
+            mask[rid >> 5] |= (1u << (rid & 31));
+            any_rid = true;
+        }
+        i += (size_t)1 + data_len;
+    }
+
+    if (!any_rid) {
+        mask[0] |= 1u; // Report ID 0 (unnumbered reports)
+    }
+}
+
+static inline bool is_report_id_declared(const mirrored_interface_t *mitf, uint8_t rid)
+{
+    if (!mitf) return false;
+    return (mitf->declared_report_ids[rid >> 5] & (1u << (rid & 31))) != 0;
+}
+
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_report, uint16_t desc_len)
 {
     uint16_t vid, pid;
     tuh_vid_pid_get(dev_addr, &vid, &pid);
+
+    // If a mouse/combo device is ALREADY cloned on another USB address (e.g. a
+    // separate standalone keyboard plugged into a second hub port alongside a
+    // standalone mouse), attach this device as an auxiliary input source without
+    // clobbering the primary cloned device's descriptors.
+    if (cloned_dev_addr != 0 && cloned_dev_addr != dev_addr && connection_state.mouse_connected) {
+        uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+        hid_instance_info_t *inst_info = alloc_hid_instance(dev_addr, instance);
+        uint8_t effective_protocol = itf_protocol;
+        if (desc_report != NULL && desc_len > 0 && itf_protocol == HID_ITF_PROTOCOL_NONE) {
+            effective_protocol = detect_usage_from_report_descriptor(desc_report, desc_len, inst_info);
+        }
+        if (inst_info) {
+            inst_info->effective_protocol = effective_protocol;
+            if (effective_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+                bool kbd_has_rid = false, kbd_is_std8 = (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD);
+                uint8_t kbd_rid = 0;
+                if (desc_report != NULL && desc_len > 0) {
+                    parse_keyboard_report_info(desc_report, desc_len, &kbd_has_rid, &kbd_rid, &kbd_is_std8);
+                }
+                inst_info->has_report_id = kbd_has_rid;
+                inst_info->keyboard_report_id = kbd_has_rid ? kbd_rid : 0;
+                inst_info->is_standard_8byte_kbd = kbd_is_std8;
+            }
+        }
+        handle_hid_device_connection(dev_addr, effective_protocol);
+        (void)tuh_hid_receive_report(dev_addr, instance);
+        neopixel_update_status();
+        return;
+    }
 
     // === DEVICE-LEVEL CLONING (once per physical device) ===
     bool first_interface_for_device = (cloned_dev_addr != dev_addr);
@@ -2360,7 +2958,11 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
         mounted_hid_itf_count = 0;
         mirrored_itf_count = 0;
         mouse_device_instance = 0;
+        kbd_device_instance = 0;
+        kbd_device_report_id = REPORT_ID_KEYBOARD;
+        active_mouse_report_id = REPORT_ID_MOUSE;
         checked_runtime_mouse_override = false;
+        force_16bit_desc_override = false;
         pending_device_reenumeration = false;
         memset(&get_report_bridge, 0, sizeof(get_report_bridge));
         memset(mirrored_itfs, 0, sizeof(mirrored_itfs));
@@ -2377,6 +2979,9 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             host_device_info.bDeviceProtocol = host_dev_desc.bDeviceProtocol;
             host_device_info.bMaxPacketSize0 = host_dev_desc.bMaxPacketSize0;
             host_device_info.bcdDevice       = host_dev_desc.bcdDevice;
+            host_device_info.iManufacturer   = host_dev_desc.iManufacturer;
+            host_device_info.iProduct        = host_dev_desc.iProduct;
+            host_device_info.iSerialNumber   = host_dev_desc.iSerialNumber;
             host_device_info.valid           = true;
 
             // Track string indices from device descriptor
@@ -2409,16 +3014,54 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
 
     mounted_hid_itf_count++;
 
-    // === DETERMINE EFFECTIVE PROTOCOL ===
+    // === SANITIZE REPORT DESCRIPTOR & DETERMINE EFFECTIVE PROTOCOL ===
+    // Strip vendor-defined top-level collections (0xFF00..0xFFFF, e.g. Logitech HID++
+    // 0x10/0x11) so G HUB / vendor software never probes the proxy as a configurable
+    // receiver while preserving Mouse, Consumer Control, and System Control collections.
+    uint8_t cleaned_desc[MIRROR_ITF_DESC_MAX];
+    const uint8_t *effective_desc = desc_report;
+    uint16_t effective_desc_len = desc_len;
+
+    if (desc_report != NULL && desc_len > 0) {
+        uint16_t stripped_len = strip_vendor_collections(desc_report, desc_len,
+                                                         cleaned_desc, sizeof(cleaned_desc));
+        if (stripped_len > 0) {
+            effective_desc = cleaned_desc;
+            effective_desc_len = stripped_len;
+        }
+    }
+
     uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
     hid_instance_info_t *inst_info = alloc_hid_instance(dev_addr, instance);
     uint8_t effective_protocol = itf_protocol;
 
-    if (itf_protocol == HID_ITF_PROTOCOL_NONE && desc_report != NULL && desc_len > 0) {
-        effective_protocol = detect_usage_from_report_descriptor(desc_report, desc_len, inst_info);
+    if (effective_desc != NULL && effective_desc_len > 0) {
+        uint8_t detected_proto = detect_usage_from_report_descriptor(effective_desc, effective_desc_len, inst_info);
+        if (itf_protocol == HID_ITF_PROTOCOL_NONE) {
+            effective_protocol = detected_proto;
+        }
     }
+
+    bool kbd_has_rid = false;
+    uint8_t kbd_rid = 0;
+    bool kbd_is_std8 = false;
+    if (effective_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+        if (effective_desc != NULL && effective_desc_len > 0) {
+            parse_keyboard_report_info(effective_desc, effective_desc_len,
+                                       &kbd_has_rid, &kbd_rid, &kbd_is_std8);
+        } else {
+            // Boot keyboard interface when report descriptor wasn't supplied
+            kbd_is_std8 = (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD);
+        }
+    }
+
     if (inst_info) {
         inst_info->effective_protocol = effective_protocol;
+        if (effective_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+            inst_info->has_report_id = kbd_has_rid;
+            inst_info->keyboard_report_id = kbd_has_rid ? kbd_rid : 0;
+            inst_info->is_standard_8byte_kbd = kbd_is_std8;
+        }
     }
 
     bool is_mouse_interface = (effective_protocol == HID_ITF_PROTOCOL_MOUSE);
@@ -2432,6 +3075,8 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
         mitf->host_dev_addr = dev_addr;
         mitf->host_instance = instance;
         mitf->is_mouse = is_mouse_interface;
+        mitf->is_standard_kbd = (effective_protocol == HID_ITF_PROTOCOL_KEYBOARD) && kbd_is_std8;
+        mitf->kbd_report_id = kbd_has_rid ? kbd_rid : 0;
 
         // Endpoint config was already parsed from config descriptor;
         // the Nth HID interface in the config maps to mirrored_itfs[N].
@@ -2442,12 +3087,12 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
             mouse_device_instance = mirror_idx;
         }
 
-        if (is_mouse_interface && desc_report != NULL && desc_len > 0) {
+        if (is_mouse_interface && effective_desc != NULL && effective_desc_len > 0) {
             // --- MOUSE INTERFACE ---
-            // Store full descriptor (including vendor collections) for the mouse interface.
-            size_t copy_len = desc_len;
+            // Store sanitized mouse/multimedia descriptor (without 0xFF00 collections).
+            size_t copy_len = effective_desc_len;
             if (copy_len > sizeof(host_mouse_desc)) copy_len = sizeof(host_mouse_desc);
-            memcpy(host_mouse_desc, desc_report, copy_len);
+            memcpy(host_mouse_desc, effective_desc, copy_len);
             host_mouse_desc_len = copy_len;
 
             // Parse mouse report layout for raw forwarding
@@ -2462,6 +3107,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
                 host_mouse_layout.x_is_16bit = true;
                 host_mouse_layout.y_is_16bit = true;
                 host_mouse_layout.report_size = 8;
+                force_16bit_desc_override = true;
             }
 
             // Classify layout for fast-path dispatch (after all fixups)
@@ -2488,16 +3134,14 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
                 inst_info->mouse_report_id = host_mouse_report_id;
             }
 
-            // Build composite HID report descriptor (keyboard + mouse + consumer)
-            build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
-
-        } else if (desc_report != NULL && desc_len > 0) {
-            // --- NON-MOUSE INTERFACE (keyboard-macros, vendor, etc.) ---
-            // Store verbatim descriptor for faithful mirroring
-            size_t copy_len = desc_len;
+        } else if (effective_desc != NULL && effective_desc_len > 0) {
+            // --- NON-MOUSE INTERFACE (boot keyboard, consumer/macros, etc.) ---
+            size_t copy_len = effective_desc_len;
             if (copy_len > MIRROR_ITF_DESC_MAX) copy_len = MIRROR_ITF_DESC_MAX;
-            memcpy(mitf->report_desc, desc_report, copy_len);
+            memcpy(mitf->report_desc, effective_desc, copy_len);
             mitf->report_desc_len = copy_len;
+            populate_declared_report_ids(mitf->report_desc, mitf->report_desc_len,
+                                         mitf->declared_report_ids);
         }
 
         mirrored_itf_count++;
@@ -2507,40 +3151,32 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
     handle_hid_device_connection(dev_addr, effective_protocol);
 
     // === START RECEIVING REPORTS ===
-    // Receive from ALL interfaces on the mouse device for vendor report passthrough.
-    // Standalone keyboards on a different device are also received.
-    // Filtering of composite macro-keyboard garbage happens in report_received_cb.
-    bool should_receive = false;
-
-    if (is_mouse_interface) {
-        should_receive = true;
-    } else if (dev_addr != connection_state.mouse_dev_addr) {
-        // Standalone keyboard on different device
-        should_receive = true;
-    } else {
-        // Non-mouse interface on same device — receive for vendor report passthrough
-        should_receive = true;
-    }
-
-    if (should_receive) {
-        if (!tuh_hid_receive_report(dev_addr, instance)) {
-            neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
-        }
+    if (!tuh_hid_receive_report(dev_addr, instance)) {
+        neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
     }
 
     // === DEFERRED RE-ENUMERATION ===
-    // Wait until all expected HID interfaces have mounted before triggering
-    // re-enumeration.  This ensures the config descriptor includes ALL
-    // interfaces, not just the first one.
+    // Wait until all expected HID interfaces have mounted before building the
+    // final runtime descriptors and triggering re-enumeration. This guarantees
+    // mirrored_itfs[] knows about BOTH keyboard (MI_00) and mouse (MI_01).
     if (mounted_hid_itf_count >= expected_hid_itf_count) {
-        // All interfaces captured — build final descriptors
-        if (host_mouse_desc_len == 0) {
-            // No mouse interface found; use defaults
-            build_runtime_hid_report_with_mouse(NULL, 0);
-        }
-        rebuild_configuration_descriptor();
+        build_runtime_hid_report_with_mouse(
+            (host_mouse_desc_len > 0) ? host_mouse_desc : NULL,
+            host_mouse_desc_len);
 
-        // Trigger re-enumeration (only fires if VID/PID actually changed)
+        if (mouse_device_instance < mirrored_itf_count &&
+            mirrored_itfs[mouse_device_instance].active &&
+            desc_hid_runtime_valid) {
+            populate_declared_report_ids(desc_hid_report_runtime,
+                                         (uint16_t)desc_hid_runtime_len,
+                                         mirrored_itfs[mouse_device_instance].declared_report_ids);
+        }
+
+        rebuild_configuration_descriptor();
+        host_hid_ready = true;
+        __dmb();
+
+        // Trigger re-enumeration on Core0 (only fires if VID/PID changed or already mounted)
         set_attached_device_vid_pid(vid, pid);
     }
 
@@ -2551,18 +3187,20 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
     (void)instance;
 
-    // Free per-instance tracking for this device
-    free_hid_instances_for_device(dev_addr);
-
-    // Reset string descriptors when device is disconnected
-    reset_device_string_descriptors();
-
-    // Handle device disconnection
-    handle_device_disconnection(dev_addr);
-
-    // Trigger visual feedback
-    neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
-    neopixel_update_status();
+    if (dev_addr == cloned_dev_addr ||
+        (cloned_dev_addr == 0 &&
+         (dev_addr == connection_state.mouse_dev_addr ||
+          dev_addr == connection_state.keyboard_dev_addr))) {
+        handle_hid_device_offline(dev_addr);
+    } else {
+        if (dev_addr == connection_state.keyboard_dev_addr) {
+            handle_physical_kbd_disconnect();
+        }
+        free_hid_instances_for_device(dev_addr);
+        handle_device_disconnection(dev_addr);
+        neopixel_trigger_activity_flash_color(COLOR_USB_DISCONNECTION);
+        neopixel_update_status();
+    }
 }
 
 // Helper: parse a mouse report from raw bytes, handling variable report sizes.
@@ -2586,9 +3224,18 @@ static void __not_in_flash_func(parse_and_forward_mouse_report)(const uint8_t *d
             host_mouse_layout.x_is_16bit = true;
             host_mouse_layout.y_is_16bit = true;
             host_mouse_layout.report_size = 8;
-            
+            force_16bit_desc_override = true;
+            classify_mouse_layout(&host_mouse_layout);
+
             // Rebuild descriptors with 16-bit override
             build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
+            if (mouse_device_instance < mirrored_itf_count &&
+                mirrored_itfs[mouse_device_instance].active &&
+                desc_hid_runtime_valid) {
+                populate_declared_report_ids(desc_hid_report_runtime,
+                                             (uint16_t)desc_hid_runtime_len,
+                                             mirrored_itfs[mouse_device_instance].declared_report_ids);
+            }
             rebuild_configuration_descriptor();
             request_device_reenumeration();
         }
@@ -2727,7 +3374,9 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
 {
     if (report == NULL || len == 0)
     {
-        tuh_hid_receive_report(dev_addr, instance);
+        if (tuh_hid_mounted(dev_addr, instance)) {
+            tuh_hid_receive_report(dev_addr, instance);
+        }
         return;
     }
 
@@ -2736,42 +3385,53 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
     hid_instance_info_t *inst_info = find_hid_instance(dev_addr, instance);
     bool has_report_id = false;
     uint8_t mouse_report_id_local = 0;
+    uint8_t kbd_report_id_local = 0;
+    bool is_std_kbd = (effective_protocol == HID_ITF_PROTOCOL_KEYBOARD);
 
     if (inst_info) {
         effective_protocol = inst_info->effective_protocol;
         has_report_id = inst_info->has_report_id;
         mouse_report_id_local = inst_info->mouse_report_id;
+        kbd_report_id_local = inst_info->keyboard_report_id;
+        is_std_kbd = inst_info->is_standard_8byte_kbd;
     }
 
     switch (effective_protocol)
     {
     case HID_ITF_PROTOCOL_KEYBOARD:
         {
-            // Only forward keyboard from standalone devices (different device than mouse)
-            if (dev_addr == connection_state.mouse_dev_addr) {
-                // Composite gaming mouse macro/media keys — queue for vendor passthrough
-                // instead of interpreting as keyboard input
+            if (has_report_id && is_std_kbd && report[0] != kbd_report_id_local) {
+                // Non-keyboard report sharing a keyboard interface (e.g. Consumer/System)
                 mirrored_interface_t *mitf = find_mirrored_interface(dev_addr, instance);
-                if (mitf) {
+                if (mitf && is_report_id_declared(mitf, report[0])) {
                     uint8_t dev_inst = mirrored_device_instance(mitf);
-                    uint8_t rid = (has_report_id && len > 0) ? report[0] : 0;
-                    const uint8_t *data = (has_report_id && len > 0) ? report + 1 : report;
-                    uint8_t dlen = (has_report_id && len > 0) ? (uint8_t)(len - 1) : (uint8_t)len;
-                    queue_vendor_report(dev_inst, rid, data, dlen);
+                    queue_vendor_report(dev_inst, report[0], report + 1, (uint8_t)(len - 1));
                 }
                 break;
             }
 
-            const uint8_t *kbd_data = report;
-            uint16_t kbd_len = len;
-
-            if (has_report_id && kbd_len > 0) {
-                kbd_data++;
-                kbd_len--;
-            }
-
-            if (kbd_len >= (int)sizeof(hid_keyboard_report_t)) {
-                process_kbd_report((const hid_keyboard_report_t*)kbd_data);
+            if (is_std_kbd) {
+                const uint8_t *kbd_data = report;
+                uint16_t kbd_len = len;
+                if (has_report_id && kbd_len > 0) {
+                    kbd_data++;
+                    kbd_len--;
+                }
+                if (kbd_len >= sizeof(hid_keyboard_report_t)) {
+                    handle_physical_kbd_report((const hid_keyboard_report_t*)kbd_data);
+                }
+            } else {
+                // Non-standard NKRO/macro keyboard interface — forward verbatim if declared
+                mirrored_interface_t *mitf = find_mirrored_interface(dev_addr, instance);
+                if (mitf) {
+                    uint8_t rid = has_report_id ? report[0] : 0;
+                    if (is_report_id_declared(mitf, rid)) {
+                        uint8_t dev_inst = mirrored_device_instance(mitf);
+                        const uint8_t *data = has_report_id ? (report + 1) : report;
+                        uint8_t dlen = has_report_id ? (uint8_t)(len - 1) : (uint8_t)len;
+                        queue_vendor_report(dev_inst, rid, data, dlen);
+                    }
+                }
             }
         }
         break;
@@ -2784,11 +3444,11 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
             if (has_report_id && mouse_len > 0) {
                 uint8_t received_id = mouse_data[0];
                 if (received_id != mouse_report_id_local) {
-                    // Not the mouse report — this is a vendor report on the mouse
-                    // interface (e.g. Logitech HID++ on same interface as mouse).
-                    // Queue for passthrough to device side.
+                    // Auxiliary report on mouse interface (e.g. Consumer 0x03 / System 0x04).
+                    // Only forward if its Report ID is declared in our exposed descriptor
+                    // (drops stripped 0xFF00 HID++ traffic cleanly).
                     mirrored_interface_t *mitf = find_mirrored_interface(dev_addr, instance);
-                    if (mitf) {
+                    if (mitf && is_report_id_declared(mitf, received_id)) {
                         uint8_t dev_inst = mirrored_device_instance(mitf);
                         queue_vendor_report(dev_inst, received_id, mouse_data + 1, (uint8_t)(mouse_len - 1));
                     }
@@ -2804,21 +3464,25 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
 
     default:
         {
-            // Unknown/vendor protocol — forward entire report for passthrough
+            // Consumer/System/other non-mouse interface — forward if declared
             mirrored_interface_t *mitf = find_mirrored_interface(dev_addr, instance);
             if (mitf) {
-                uint8_t dev_inst = mirrored_device_instance(mitf);
                 uint8_t rid = (has_report_id && len > 0) ? report[0] : 0;
-                const uint8_t *data = (has_report_id && len > 0) ? report + 1 : report;
-                uint8_t dlen = (has_report_id && len > 0) ? (uint8_t)(len - 1) : (uint8_t)len;
-                queue_vendor_report(dev_inst, rid, data, dlen);
+                if (is_report_id_declared(mitf, rid)) {
+                    uint8_t dev_inst = mirrored_device_instance(mitf);
+                    const uint8_t *data = (has_report_id && len > 0) ? report + 1 : report;
+                    uint8_t dlen = (has_report_id && len > 0) ? (uint8_t)(len - 1) : (uint8_t)len;
+                    queue_vendor_report(dev_inst, rid, data, dlen);
+                }
             }
         }
         break;
     }
 
-    // Continue to request reports
-    tuh_hid_receive_report(dev_addr, instance);
+    // Continue to request reports while still mounted
+    if (tuh_hid_mounted(dev_addr, instance)) {
+        tuh_hid_receive_report(dev_addr, instance);
+    }
 }
 
 void tuh_hid_get_report_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t report_id, uint8_t report_type, uint16_t len)
@@ -2849,13 +3513,10 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t 
 // HID device callbacks with improved validation
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
 {
-    // Guard against out-of-range instances. Use CFG_TUD_HID (all device HID
-    // instances incl. the KMBox control interface), not MAX_DEVICE_HID_INTERFACES
-    // (mirrored only) — a 4-interface mouse puts KMBox control at instance 4.
     if (instance >= CFG_TUD_HID || !buffer || reqlen == 0) return 0;
 
+#if ENABLE_KMBOX_USB_CONTROL
     // KMBox USB Control: status query via feature report
-    // Return a short status string with humanization mode and queue info
     if (instance == kmbox_control_instance() && report_type == HID_REPORT_TYPE_FEATURE) {
         humanization_mode_t hm = smooth_get_humanization_mode();
         uint8_t queue_count = 0;
@@ -2866,11 +3527,15 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
         if (len < 0) len = 0;
         return (uint16_t)(len < reqlen ? len : reqlen - 1);
     }
+#endif
 
-    // Real passthrough for vendor/feature/input GET_REPORT. Logitech G Hub,
-    // Razer Synapse, etc. use this for identity, battery, DPI and profile
-    // handshakes; cached zeros make Windows software reject the device.
-    if (instance < mirrored_itf_count && mirrored_itfs[instance].active &&
+    // Only bridge synchronous FEATURE report queries when the host device is ready
+    // and the Report ID is actually exposed on this interface. Never block Core0 on
+    // GET_REPORT(INPUT) during OS enumeration.
+    if (report_type == HID_REPORT_TYPE_FEATURE &&
+        host_hid_ready &&
+        instance < mirrored_itf_count && mirrored_itfs[instance].active &&
+        is_report_id_declared(&mirrored_itfs[instance], report_id) &&
         !get_report_bridge.pending && !get_report_bridge.busy) {
         mirrored_interface_t *mitf = &mirrored_itfs[instance];
 
@@ -2918,19 +3583,19 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
     }
 
     // Look up cached report from the real device
-    cached_report_t *slots = report_cache[instance];
-    __dmb();  // Ensure we see Core1's latest cache writes
-    for (int i = 0; i < REPORT_CACHE_SLOTS_PER_ITF; i++) {
-        if (slots[i].valid && slots[i].report_id == report_id && slots[i].report_type == (uint8_t)report_type) {
-            uint16_t copy_len = (slots[i].len < reqlen) ? slots[i].len : reqlen;
-            memcpy(buffer, slots[i].data, copy_len);
-            return copy_len;
+    if (instance < MAX_DEVICE_HID_INTERFACES) {
+        cached_report_t *slots = report_cache[instance];
+        __dmb();  // Ensure we see Core1's latest cache writes
+        for (int i = 0; i < REPORT_CACHE_SLOTS_PER_ITF; i++) {
+            if (slots[i].valid && slots[i].report_id == report_id && slots[i].report_type == (uint8_t)report_type) {
+                uint16_t copy_len = (slots[i].len < reqlen) ? slots[i].len : reqlen;
+                memcpy(buffer, slots[i].data, copy_len);
+                return copy_len;
+            }
         }
     }
 
     // No cached data yet — return zeros so the host sees the device as responsive.
-    // macOS IOKit sends GET_REPORT during device open; returning 0 (no data) causes
-    // "open failed". Returning a zeroed buffer keeps the open path happy.
     uint16_t fill_len = (reqlen > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : reqlen;
     memset(buffer, 0, fill_len);
     return fill_len;
@@ -2938,17 +3603,7 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
 
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, const uint8_t *buffer, uint16_t bufsize)
 {
-    //------------------------------------------------------------------+
-    // KMBox USB Control Interface: intercept KM commands before forwarding
-    //------------------------------------------------------------------+
-    // Output report to KMBox interface: check for 0xF0 0xAA magic prefix.
-    // Prefix found → process payload as KM command.
-    // No prefix → ignored (not a valid KMBox command).
-    //
-    // Accept the prefix at offset 0 (WebHID sendReport() delivers the report
-    // data verbatim) OR at offset 1 behind a leading 0x00 (hidapi prepends a
-    // report-ID byte per its API contract; 0x00 for interfaces without report
-    // IDs). This keeps the command channel working across both host stacks.
+#if ENABLE_KMBOX_USB_CONTROL
     if (instance == kmbox_control_instance()) {
         const uint8_t *payload = NULL;
         uint16_t payload_len = 0;
@@ -2965,16 +3620,18 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
         }
 
         if (payload != NULL) {
-            // All KM commands arriving over the HID control interface are
-            // processed with the full feature set (movement, wheel, buttons,
-            // keyboard, Xbox, config, ...) — identical to the UART path.
             kmbox_process_command_buffer(payload, payload_len);
         }
         return;
     }
+#endif
 
-    // Handle keyboard LED output reports (caps lock, etc.)
-    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == runtime_kbd_report_id)
+    // Handle keyboard LED output reports locally (Caps Lock, Num Lock, Scroll Lock)
+    // for both dedicated Boot Keyboard interfaces (report_id == 0 on MI_00) and
+    // composite keyboard interfaces (runtime_kbd_report_id).
+    if (report_type == HID_REPORT_TYPE_OUTPUT &&
+        ((instance == kbd_device_instance && (report_id == kbd_device_report_id || report_id == 0)) ||
+         report_id == runtime_kbd_report_id))
     {
         if (buffer == NULL || bufsize < MIN_BUFFER_SIZE) return;
 
@@ -2989,10 +3646,11 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
         return;
     }
 
-    // Forward all other SET_REPORT requests to the real mouse for vendor passthrough.
-    // This enables Logitech G Hub, Razer Synapse, etc. to configure DPI, lighting,
-    // macros, battery queries through the proxy.
-    if (buffer != NULL && bufsize > 0 && instance < mirrored_itf_count && mirrored_itfs[instance].active) {
+    // Forward other valid SET_REPORT requests only if declared on the mirrored interface
+    if (buffer != NULL && bufsize > 0 &&
+        host_hid_ready &&
+        instance < mirrored_itf_count && mirrored_itfs[instance].active &&
+        is_report_id_declared(&mirrored_itfs[instance], report_id)) {
         mirrored_interface_t *mitf = &mirrored_itfs[instance];
 
         uint8_t next_head = (set_report_queue.head + 1) & VENDOR_QUEUE_MASK;
@@ -3170,8 +3828,8 @@ uint8_t const * tud_descriptor_device_cb(void)
         // Clone device revision from host
         .bcdDevice          = host_device_info.valid ? host_device_info.bcdDevice : 0x0100,
 
-        .iManufacturer      = 0x01,
-        .iProduct           = 0x02,
+        .iManufacturer      = (host_device_info.valid && host_device_info.iManufacturer == 0) ? 0x00 : 0x01,
+        .iProduct           = (host_device_info.valid && host_device_info.iProduct == 0) ? 0x00 : 0x02,
         .iSerialNumber      = attached_has_serial ? 0x03 : 0x00,
 
         .bNumConfigurations = 0x01
@@ -3181,14 +3839,16 @@ uint8_t const * tud_descriptor_device_cb(void)
 }
 
 // HID Report Descriptor — per-instance for multi-interface mirroring.
-// Instance 0 is typically the mouse interface (composite: keyboard + mouse + consumer).
-// Other instances return verbatim cloned descriptors from the host device.
+// Instance 0 is typically the mouse interface (composite: keyboard + mouse + consumer)
+// or MI_00 Boot Keyboard when mirroring a 2-interface combo dongle like 046D:C534.
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
-    // KMBox USB control interface — always the last interface
+#if ENABLE_KMBOX_USB_CONTROL
+    // KMBox USB control interface — always the last interface when enabled
     if (instance == kmbox_control_instance()) {
         return desc_hid_kmbox_control;
     }
+#endif
 
     // Multi-interface mode: return the correct descriptor for each instance
     if (mirrored_itf_count > 0 && instance < mirrored_itf_count && mirrored_itfs[instance].active) {
@@ -3278,14 +3938,16 @@ static uint16_t write_hid_interface_desc(uint8_t *buf, uint16_t buf_max,
 }
 
 // Build the configuration descriptor from current runtime state.
-// Supports 1-4 HID interfaces mirroring the host device's layout,
-// plus 1 dedicated KMBox USB control interface.
+// Supports 1-4 HID interfaces mirroring the host device's layout.
 static void rebuild_configuration_descriptor(void) {
     uint8_t num_mirrored = (mirrored_itf_count > 0) ? mirrored_itf_count : 1;
     if (num_mirrored > MAX_DEVICE_HID_INTERFACES) num_mirrored = MAX_DEVICE_HID_INTERFACES;
 
-    // Add 1 for the KMBox USB control interface
+#if ENABLE_KMBOX_USB_CONTROL
     uint8_t num_itfs = num_mirrored + 1;
+#else
+    uint8_t num_itfs = num_mirrored;
+#endif
 
     uint8_t cfg_attributes = TU_BIT(7) | (host_config_info.valid ? host_config_info.bmAttributes : TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP);
     uint8_t cfg_max_power = host_config_info.valid ? host_config_info.bMaxPower : (USB_CONFIG_POWER_MA / 2);
@@ -3335,7 +3997,8 @@ static void rebuild_configuration_descriptor(void) {
         pos += written;
     }
 
-    // Add KMBox USB control interface (no boot protocol, vendor subclass)
+#if ENABLE_KMBOX_USB_CONTROL
+    // Add KMBox USB control interface (only when explicitly enabled at compile time)
     {
         uint16_t written = write_hid_interface_desc(
             &desc_configuration_runtime[pos], DESC_CONFIG_RUNTIME_MAX - pos,
@@ -3346,13 +4009,11 @@ static void rebuild_configuration_descriptor(void) {
             0x81 + num_mirrored,       // EP IN address
             CFG_TUD_HID_EP_BUFSIZE,
             HID_POLLING_INTERVAL_MS,
-            true, HID_POLLING_INTERVAL_MS  // OUT endpoint: hidapi writes via interrupt OUT;
-                                          // TinyUSB routes it to tud_hid_set_report_cb the
-                                          // same way as SET_REPORT (WebHID sendReport)
-
+            true, HID_POLLING_INTERVAL_MS
         );
         if (written > 0) pos += written;
     }
+#endif
 
     // Fill config descriptor header (first 9 bytes)
     desc_configuration_runtime[0] = 9;                          // bLength
@@ -3481,10 +4142,10 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 // String Descriptors
 char const *string_desc_arr[] =
     {
-        (const char[]){USB_LANGUAGE_ENGLISH_US_BYTE1, USB_LANGUAGE_ENGLISH_US_BYTE2}, // 0: is supported language is English (0x0409)
+        (const char[]){USB_LANGUAGE_ENGLISH_US_BYTE1, USB_LANGUAGE_ENGLISH_US_BYTE2}, // 0: supported language English (0x0409)
         MANUFACTURER_STRING,                                                          // 1: Manufacturer
         PRODUCT_STRING,                                                               // 2: Product
-        "PIOKMbox_fallback"                                                           // 3: Fallback serial (unused - dynamic serial used instead)
+        ""                                                                            // 3: Serial (only used when attached_has_serial)
 };
 
 static uint16_t _desc_str[MAX_STRING_DESCRIPTOR_CHARS + 1];
@@ -3549,12 +4210,17 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
                     if (attached_has_serial && strlen(attached_serial) > 0) {
                         str = attached_serial;
                     } else {
-                        str = get_dynamic_serial_string();
+                        return NULL;
                     }
                     break;
                 default:
                     break;
             }
+        }
+
+        // Do not fabricate a serial string when no serial number is present
+        if (index == STRING_DESC_SERIAL_IDX && !attached_has_serial) {
+            return NULL;
         }
 
         // Check extra string cache for higher indices (interface strings, etc.)
@@ -3572,11 +4238,6 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
             if (index < sizeof(string_desc_arr) / sizeof(string_desc_arr[0])) {
                 str = string_desc_arr[index];
             }
-        }
-
-        // Final fallback for serial
-        if (str == NULL && index == STRING_DESC_SERIAL_IDX) {
-            str = get_dynamic_serial_string();
         }
 
         if (str == NULL) return NULL;

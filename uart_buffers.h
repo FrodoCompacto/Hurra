@@ -26,11 +26,9 @@
 #define UART_RX_BUFFER_SIZE     2048
 #define UART_RX_BUFFER_MASK     (UART_RX_BUFFER_SIZE - 1)
 
-// TX Buffer: Holds outgoing responses to Bridge  
-// - Longest response ~64 bytes (status messages)
-// - Usually just short ACKs (8-16 bytes)
-// - 128 bytes is plenty
-#define UART_TX_BUFFER_SIZE     128
+// TX Buffer: Holds outgoing responses to Bridge / Serial
+// - 512 bytes fits full multi-line KMBOX_INFO diagnostics even before DMA TX starts
+#define UART_TX_BUFFER_SIZE     512
 #define UART_TX_BUFFER_MASK     (UART_TX_BUFFER_SIZE - 1)
 
 //=============================================================================
