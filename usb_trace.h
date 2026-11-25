@@ -10,6 +10,13 @@ typedef enum {
     TRACE_MOUSE, TRACE_KEY
 } usb_trace_kind_t;
 
+typedef enum {
+    TRACE_PC_DISCONNECT, TRACE_PC_CONNECT, TRACE_PC_MOUNT,
+    TRACE_UART_DMA_INIT, TRACE_UART_DMA_RX, TRACE_UART_DMA_TX_READY,
+    TRACE_MILESTONE_COUNT
+} usb_trace_milestone_t;
+
+void usb_trace_mark(usb_trace_milestone_t milestone);
 void usb_trace_init(void);
 void usb_trace_open(unsigned slot, uint8_t dev, uint8_t ep);
 void usb_trace_in(unsigned slot, usb_trace_kind_t result);

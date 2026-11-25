@@ -23,6 +23,9 @@ typedef struct {
     bool frozen;
     uint32_t root_ms, hub_ep_ms, mouse_ms, key_ms;
     uint32_t hid_ms[CFG_TUH_HID];
+    struct {
+        uint32_t before_ms, after_ms;
+    } milestones[TRACE_MILESTONE_COUNT];
 } trace_log_t;
 
 static critical_section_t lock;
@@ -47,6 +50,18 @@ static void append(uint32_t ms, usb_trace_kind_t kind, uint8_t dev, uint8_t deta
 void usb_trace_init(void) {
     critical_section_init(&lock);
     append(now_ms(), TRACE_BOOT, 0, 0);
+}
+
+// Keep the last mark before the HID fault and the first one afterwards.
+// The HID event ring remains frozen even if USB reconnects or DMA starts later.
+void usb_trace_mark(usb_trace_milestone_t milestone) {
+    critical_section_enter_blocking(&lock);
+    if (!log_data.frozen) {
+        log_data.milestones[milestone].before_ms = now_ms();
+    } else if (!log_data.milestones[milestone].after_ms) {
+        log_data.milestones[milestone].after_ms = now_ms();
+    }
+    critical_section_exit(&lock);
 }
 
 void usb_trace_event(usb_trace_kind_t kind, uint8_t dev, uint8_t detail) {
@@ -127,6 +142,19 @@ void usb_trace_format(char *buf, size_t capacity) {
         if (!snapshot.hid_ms[itf]) continue;
         n = snprintf(buf + used, capacity - used, "hid_itf=%u mount_ms=%lu\r\n",
                      itf, (unsigned long)snapshot.hid_ms[itf]);
+        if (n < 0 || (size_t)n >= capacity - used) return;
+        used += (size_t)n;
+    }
+    static const char *const milestones[TRACE_MILESTONE_COUNT] = {
+        [TRACE_PC_DISCONNECT]="pc_disconnect", [TRACE_PC_CONNECT]="pc_connect",
+        [TRACE_PC_MOUNT]="pc_mount", [TRACE_UART_DMA_INIT]="uart_dma_init",
+        [TRACE_UART_DMA_RX]="uart_dma_rx", [TRACE_UART_DMA_TX_READY]="uart_dma_tx_ready"
+    };
+    for (unsigned m = 0; m < TRACE_MILESTONE_COUNT; m++) {
+        if (!snapshot.milestones[m].before_ms && !snapshot.milestones[m].after_ms) continue;
+        n = snprintf(buf + used, capacity - used, "%s before_ms=%lu after_ms=%lu\r\n",
+                     milestones[m], (unsigned long)snapshot.milestones[m].before_ms,
+                     (unsigned long)snapshot.milestones[m].after_ms);
         if (n < 0 || (size_t)n >= capacity - used) return;
         used += (size_t)n;
     }

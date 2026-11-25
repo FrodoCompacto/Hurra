@@ -1151,6 +1151,7 @@ void kmbox_serial_init(void) {
 }
 
 void kmbox_serial_init_dma(void) {
+    usb_trace_mark(TRACE_UART_DMA_INIT);
     // Set up DMA circular buffer for UART RX (zero-CPU reception)
     uart_rx_dma_chan = dma_claim_unused_channel(false);
     if (uart_rx_dma_chan < 0) {
@@ -1177,6 +1178,7 @@ void kmbox_serial_init_dma(void) {
         true                                     // Start immediately
     );
     
+    usb_trace_mark(TRACE_UART_DMA_RX);
     printf("[KMBOX] DMA RX initialized: ch=%d, buf=%u bytes\n", uart_rx_dma_chan, UART_RX_BUFFER_SIZE);
     
     //--------------------------------------------------------------------+
@@ -1215,6 +1217,7 @@ void kmbox_serial_init_dma(void) {
     uart_set_irq_enables(KMBOX_UART, false, false);
     g_uart_tx_buffer.tx_active = false;
     
+    usb_trace_mark(TRACE_UART_DMA_TX_READY);
     printf("[KMBOX] DMA TX initialized: ch=%d, buf=%u bytes\n", uart_tx_dma_chan, DMA_TX_BUFFER_SIZE);
 }
 

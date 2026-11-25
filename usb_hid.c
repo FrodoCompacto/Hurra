@@ -129,6 +129,7 @@ void set_attached_device_vid_pid(uint16_t vid, uint16_t pid) {
 
 void force_usb_reenumeration() {
     // Disconnect from USB host
+    usb_trace_mark(TRACE_PC_DISCONNECT);
     tud_disconnect();
     
     // Wait for host to recognize disconnection (500ms for Windows/macOS)
@@ -139,6 +140,7 @@ void force_usb_reenumeration() {
     }
     
     // Reconnect with new descriptor
+    usb_trace_mark(TRACE_PC_CONNECT);
     tud_connect();
     
     // Wait for reconnection (250ms for stability)
@@ -2833,6 +2835,7 @@ void hid_host_task(void)
 // Device callbacks with improved error handling
 void tud_mount_cb(void)
 {
+    usb_trace_mark(TRACE_PC_MOUNT);
     led_set_blink_interval(LED_BLINK_MOUNTED_MS);
     neopixel_update_status();
 }

@@ -540,6 +540,15 @@ To inspect a failure after startup, leave the hub and receiver attached during
 boot. After input stops, send `KMBOX_TRACE` followed by a newline on the control
 UART. The trace lives in RAM until the next reset. Reading it is repeatable.
 
+To compare startup timing with a receive failure, look for `pc_disconnect` and
+`pc_connect` (firmware requests to detach and attach to the PC), `pc_mount`
+(the PC configured the device), and `uart_dma_init`, `uart_dma_rx`, and
+`uart_dma_tx_ready` (initialization entered, RX running, and TX ready).
+For each mark, `before_ms` is the last occurrence before the trace froze, or
+the latest while live. `after_ms` is the first occurrence after freezing.
+Zero means unseen. These marks survive ring rollover and share the clock used
+by the `no_start` rows.
+
 The header shows `live` until an interrupt IN endpoint on a mounted HID device
 has delivered data and then fails three polls in a row. A normal NAK or data
 packet breaks the streak. At the third failure the history freezes. Times are
