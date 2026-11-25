@@ -128,57 +128,48 @@ void set_attached_device_vid_pid(uint16_t vid, uint16_t pid) {
 }
 
 #ifdef WAVESHARE_RP2350_USB_C
-static const unsigned first_reconnect_delay_ms = 2000;
-#else
-static const unsigned first_reconnect_delay_ms = 0;
+// Core0 keeps servicing USB, UART and watchdogs until the first detach is due.
+static bool first_disconnect_scheduled;
+static bool disconnect_waiting;
+static absolute_time_t disconnect_deadline;
 #endif
-// Owned by Core0. The regular loop keeps servicing UART and watchdogs while waiting.
-static bool first_reconnect_delayed;
-static bool reconnect_waiting;
-static absolute_time_t reconnect_deadline;
 
-static void reconnect_usb_device(void) {
-    // Reconnect with new descriptor
+static void reenumerate_usb_device(void) {
+    usb_trace_mark(TRACE_PC_DISCONNECT);
+    tud_disconnect();
+    for (int i = 0; i < 50; i++) {
+        sleep_ms(10);
+        watchdog_core0_heartbeat();
+    }
+
     usb_trace_mark(TRACE_PC_CONNECT);
     tud_connect();
-
-    // Wait for reconnection (250ms for stability)
-    // Feed watchdog during wait
     for (int i = 0; i < 25; i++) {
         sleep_ms(10);
         watchdog_core0_heartbeat();
     }
 }
 
-void usb_reconnect_task(void) {
-    if (reconnect_waiting && time_reached(reconnect_deadline)) {
-        reconnect_waiting = false;
-        reconnect_usb_device();
+void usb_reenumeration_task(void) {
+#ifdef WAVESHARE_RP2350_USB_C
+    if (disconnect_waiting && time_reached(disconnect_deadline)) {
+        disconnect_waiting = false;
+        reenumerate_usb_device();
     }
+#endif
 }
 
 void force_usb_reenumeration(void) {
-    if (reconnect_waiting) return;
-
-    // Disconnect from USB host
-    usb_trace_mark(TRACE_PC_DISCONNECT);
-    tud_disconnect();
-    
-    // Wait for host to recognize disconnection (500ms for Windows/macOS)
-    // Feed watchdog during long wait to prevent reset
-    for (int i = 0; i < 50; i++) {
-        sleep_ms(10);
-        watchdog_core0_heartbeat();
-    }
-    
-    // Only the first Waveshare reconnect is shifted for the startup timing test.
-    if (first_reconnect_delay_ms && !first_reconnect_delayed) {
-        first_reconnect_delayed = true;
-        reconnect_deadline = make_timeout_time_ms(first_reconnect_delay_ms);
-        reconnect_waiting = true;
+#ifdef WAVESHARE_RP2350_USB_C
+    if (disconnect_waiting) return;
+    if (!first_disconnect_scheduled) {
+        first_disconnect_scheduled = true;
+        disconnect_deadline = make_timeout_time_ms(2000);
+        disconnect_waiting = true;
         return;
     }
-    reconnect_usb_device();
+#endif
+    reenumerate_usb_device();
 }
 
 static inline void request_device_reenumeration(void) {

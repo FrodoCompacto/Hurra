@@ -123,7 +123,7 @@ const char* get_dynamic_serial_string(void);
 
 // Function to force USB re-enumeration
 void force_usb_reenumeration(void);
-void usb_reconnect_task(void);
+void usb_reenumeration_task(void);
 
 // TinyUSB Host callbacks
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_report, uint16_t desc_len);
