@@ -58,17 +58,21 @@ static gip_packet_queue_t device_to_host_queue;
 
 // IN transfer buffer
 static uint8_t  xfer_buf_in[GIP_MAX_PACKET_SIZE];
+// USB transfers retain the buffer until completion. Only modify when OUT is idle.
+static uint8_t xfer_buf_out[GIP_MAX_PACKET_SIZE];
+static uint8_t pending_out_len;
+static bool power_on_pending;
 
 // Spinlock numbers for shared state (claim unique IDs from Pico SDK pool)
-#define XBOX_SPINLOCK_GAMEPAD   24
-#define XBOX_SPINLOCK_H2D_QUEUE 25
-#define XBOX_SPINLOCK_D2H_QUEUE 26
+static int gamepad_lock_num = -1;
+static int h2d_lock_num = -1;
+static int d2h_lock_num = -1;
 
 //--------------------------------------------------------------------+
 // Forward Declarations
 //--------------------------------------------------------------------+
 
-static void xbox_host_send_power_on(void);
+static bool xbox_host_send_power_on(void);
 static void xbox_host_process_gip_packet(const uint8_t *data, uint16_t len);
 static void xbox_host_submit_in_xfer(void);
 
@@ -77,14 +81,22 @@ static void xbox_host_submit_in_xfer(void);
 //--------------------------------------------------------------------+
 
 static bool xbox_host_driver_init(void) {
+    pending_out_len = 0;
+    power_on_pending = false;
     memset(&gamepad_state, 0, sizeof(gamepad_state));
-    gamepad_state.lock = spin_lock_instance(XBOX_SPINLOCK_GAMEPAD);
-    gip_queue_init(&host_to_device_queue, XBOX_SPINLOCK_H2D_QUEUE);
-    gip_queue_init(&device_to_host_queue, XBOX_SPINLOCK_D2H_QUEUE);
+    // Firmware-lifetime claims survive USB stack reinitialization.
+    if (gamepad_lock_num < 0) gamepad_lock_num = spin_lock_claim_unused(true);
+    if (h2d_lock_num < 0) h2d_lock_num = spin_lock_claim_unused(true);
+    if (d2h_lock_num < 0) d2h_lock_num = spin_lock_claim_unused(true);
+    gamepad_state.lock = spin_lock_init((unsigned)gamepad_lock_num);
+    gip_queue_init(&host_to_device_queue, (unsigned)h2d_lock_num);
+    gip_queue_init(&device_to_host_queue, (unsigned)d2h_lock_num);
     return true;
 }
 
 static bool xbox_host_driver_deinit(void) {
+    pending_out_len = 0;
+    power_on_pending = false;
     xbox_mounted = false;
     xbox_ep_in = 0;
     xbox_ep_out = 0;
@@ -146,7 +158,7 @@ static bool xbox_host_driver_set_config(uint8_t dev_addr, uint8_t itf_num) {
     (void)itf_num;
 
     // Send power-on command to controller
-    xbox_host_send_power_on();
+    power_on_pending = !xbox_host_send_power_on();
 
     // Start listening for IN transfers
     xbox_host_submit_in_xfer();
@@ -173,9 +185,11 @@ static bool __not_in_flash_func(xbox_host_driver_xfer_cb)(uint8_t dev_addr, uint
         return true;
     }
 
-    if (ep_addr == xbox_ep_in && xferred_bytes >= GIP_HEADER_SIZE) {
+    if (ep_addr == xbox_ep_in) {
         // Process received GIP packet from controller
-        xbox_host_process_gip_packet(xfer_buf_in, (uint16_t)xferred_bytes);
+        if (xferred_bytes >= GIP_HEADER_SIZE && xferred_bytes <= sizeof(xfer_buf_in)) {
+            xbox_host_process_gip_packet(xfer_buf_in, (uint16_t)xferred_bytes);
+        }
 
         // Re-submit IN transfer for next packet
         xbox_host_submit_in_xfer();
@@ -186,6 +200,8 @@ static bool __not_in_flash_func(xbox_host_driver_xfer_cb)(uint8_t dev_addr, uint
 
 static void xbox_host_driver_close(uint8_t dev_addr) {
     if (dev_addr == xbox_dev_addr) {
+        pending_out_len = 0;
+        power_on_pending = false;
         xbox_mounted = false;
         xbox_ep_in = 0;
         xbox_ep_out = 0;
@@ -277,18 +293,17 @@ static void __not_in_flash_func(xbox_host_process_gip_packet)(const uint8_t *dat
 // GIP Command Helpers
 //--------------------------------------------------------------------+
 
-static void xbox_host_send_power_on(void) {
+static bool xbox_host_send_power_on(void) {
+    if (!xbox_mounted || !xbox_ep_out || usbh_edpt_busy(xbox_dev_addr, xbox_ep_out)) return false;
     // GIP power-on command: command=0x05, flags=0x20, sequence, length=1, payload=0x00
-    uint8_t pkt[GIP_HEADER_SIZE + 1];
+    uint8_t *pkt = xfer_buf_out;
     pkt[0] = GIP_CMD_POWER;
     pkt[1] = GIP_FLAG_INTERNAL;  // Internal flag
     pkt[2] = gip_seq_host++;
     pkt[3] = 1;                  // Payload length
     pkt[4] = 0x00;               // Power on
 
-    if (xbox_mounted && xbox_ep_out) {
-        usbh_edpt_xfer(xbox_dev_addr, xbox_ep_out, pkt, sizeof(pkt));
-    }
+    return usbh_edpt_xfer(xbox_dev_addr, xbox_ep_out, pkt, GIP_HEADER_SIZE + 1);
 }
 
 static void xbox_host_submit_in_xfer(void) {
@@ -297,17 +312,16 @@ static void xbox_host_submit_in_xfer(void) {
     }
 }
 
-static void xbox_host_send_keepalive(void) {
+static bool xbox_host_send_keepalive(void) {
+    if (!xbox_mounted || !xbox_ep_out || usbh_edpt_busy(xbox_dev_addr, xbox_ep_out)) return false;
     // GIP keepalive: command=0x03, internal flag
-    uint8_t pkt[GIP_HEADER_SIZE];
+    uint8_t *pkt = xfer_buf_out;
     pkt[0] = GIP_CMD_STATUS;
     pkt[1] = GIP_FLAG_INTERNAL;
     pkt[2] = gip_seq_host++;
     pkt[3] = 0; // No payload
 
-    if (xbox_mounted && xbox_ep_out) {
-        usbh_edpt_xfer(xbox_dev_addr, xbox_ep_out, pkt, sizeof(pkt));
-    }
+    return usbh_edpt_xfer(xbox_dev_addr, xbox_ep_out, pkt, GIP_HEADER_SIZE);
 }
 
 //--------------------------------------------------------------------+
@@ -322,19 +336,26 @@ void xbox_host_init(void) {
 void __not_in_flash_func(xbox_host_task)(void) {
     if (!xbox_mounted) return;
 
-    // Drain device_to_host_queue: forward console commands to controller
-    uint8_t pkt_buf[GIP_MAX_PACKET_SIZE];
-    uint8_t pkt_len;
-    while (gip_queue_pop(&device_to_host_queue, pkt_buf, &pkt_len)) {
-        if (xbox_ep_out) {
-            usbh_edpt_xfer(xbox_dev_addr, xbox_ep_out, pkt_buf, pkt_len);
-        }
+    if (!xbox_ep_out || usbh_edpt_busy(xbox_dev_addr, xbox_ep_out)) return;
+    if (power_on_pending) {
+        power_on_pending = !xbox_host_send_power_on();
+        return;
     }
 
-    // Keepalive timer
+    // Keep a popped packet until submission succeeds; never drain a busy endpoint.
+    if (!pending_out_len) {
+        gip_queue_pop(&device_to_host_queue, xfer_buf_out, &pending_out_len);
+    }
+    if (pending_out_len) {
+        if (usbh_edpt_xfer(xbox_dev_addr, xbox_ep_out, xfer_buf_out, pending_out_len)) {
+            pending_out_len = 0;
+        }
+        return;
+    }
+
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if ((now - last_keepalive_ms) >= GIP_KEEPALIVE_INTERVAL_MS) {
-        xbox_host_send_keepalive();
+    if ((now - last_keepalive_ms) >= GIP_KEEPALIVE_INTERVAL_MS &&
+        xbox_host_send_keepalive()) {
         last_keepalive_ms = now;
     }
 }

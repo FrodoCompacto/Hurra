@@ -75,6 +75,7 @@ static __force_inline int16_t read_i16_le(const uint8_t *p) {
 static uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE] __attribute__((aligned(UART_RX_BUFFER_SIZE)));
 static volatile uint32_t uart_rx_read_pos = 0;
 static int uart_rx_dma_chan = -1;
+static uint32_t uart_rx_poll_write_pos;
 
 //--------------------------------------------------------------------+
 // TX DMA (zero-CPU transmission)
@@ -90,7 +91,17 @@ static volatile bool dma_tx_busy = false;
 // DMA-based RX: get current write position from DMA write address
 // __force_inline guarantees inlining even at -Os (Pico SDK macro)
 static __force_inline uint32_t rx_get_write_pos(void) {
-    if (uart_rx_dma_chan < 0) return 0;
+    if (uart_rx_dma_chan < 0) {
+        // Startup and allocation-failure fallback. Reserve one ring slot so
+        // a full buffer cannot masquerade as empty; leave remaining bytes in FIFO.
+        while (uart_is_readable(KMBOX_UART)) {
+            uint32_t next = (uart_rx_poll_write_pos + 1) & UART_RX_BUFFER_MASK;
+            if (next == uart_rx_read_pos) break;
+            uart_rx_buffer[uart_rx_poll_write_pos] = (uint8_t)uart_getc(KMBOX_UART);
+            uart_rx_poll_write_pos = next;
+        }
+        return uart_rx_poll_write_pos;
+    }
     uintptr_t write_addr = (uintptr_t)dma_channel_hw_addr(uart_rx_dma_chan)->write_addr;
     return (uint32_t)((write_addr - (uintptr_t)uart_rx_buffer) & UART_RX_BUFFER_MASK);
 }
@@ -492,7 +503,7 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             // timing, handled by kmbox_update_states() on each main loop tick.
             // Only single-click is supported; the count field is ignored for now
             // because multi-click requires waiting for each click to complete.
-            uint32_t click_now = time_us_32() / 1000;
+            uint32_t click_now = to_ms_since_boot(get_absolute_time());
             kmbox_start_button_click(btn, click_now);
             fast_cmd_count++;
             return true;
@@ -1099,6 +1110,7 @@ void kmbox_serial_init(void) {
     
     // Initialize state
     uart_rx_read_pos = 0;
+    uart_rx_poll_write_pos = 0;
     
     // Initialize TX ring buffer
     tx_buffer_init(&g_uart_tx_buffer);
@@ -1172,7 +1184,7 @@ void kmbox_serial_init_dma(void) {
     dma_channel_configure(
         uart_rx_dma_chan,
         &rx_cfg,
-        uart_rx_buffer,                          // Write to ring buffer
+        uart_rx_buffer + uart_rx_poll_write_pos, // Preserve unread polled bytes
         &uart_get_hw(KMBOX_UART)->dr,           // Read from UART data register
         0xFFFFFFFF,                              // Transfer "forever"
         true                                     // Start immediately
@@ -1226,11 +1238,8 @@ void kmbox_serial_init_dma(void) {
 //--------------------------------------------------------------------+
 
 void kmbox_serial_task(void) {
-    // Use cheap microsecond timer — avoid to_ms_since_boot(get_absolute_time())
-    // which has significant overhead.  Convert to ms only when needed.
-    uint32_t now_us = time_us_32();
-    uint32_t now_ms = now_us / 1000;
-    
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
     // Periodic ping to bridge (every 5 seconds)
     if (now_ms - g_last_ping_time_ms > 5000) {
         g_last_ping_time_ms = now_ms;
