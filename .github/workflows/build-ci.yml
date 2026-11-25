@@ -178,6 +178,7 @@ jobs:
         cd tools
         x86_64-w64-mingw32-gcc -Wall -Wextra -O2 \
           -I../lib/wire-protocol/include \
+          -I../lib/hid-defs/include \
           -o kmbox_relay.exe kmbox_relay.c -lws2_32
         echo "Build successful:"
         ls -la kmbox_relay.exe
@@ -187,6 +188,7 @@ jobs:
         cd tools
         gcc -Wall -Wextra -O2 \
           -I../lib/wire-protocol/include \
+          -I../lib/hid-defs/include \
           -o kmbox_relay kmbox_relay.c
         echo "Build successful:"
         ls -la kmbox_relay
