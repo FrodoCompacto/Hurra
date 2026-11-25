@@ -32,7 +32,7 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 # Board selection: metro (Adafruit Metro RP2350), waveshare (Waveshare RP2350-USB-C), or pico2 (RP2350 only)
-set(PICO_BOARD adafruit_metro_rp2350 CACHE STRING "Board type")
+set(PICO_BOARD waveshare_rp2350_usb_c CACHE STRING "Board type")
 
 # Tell the SDK where to find custom board headers (e.g. adafruit_metro_rp2350.h)
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
@@ -102,10 +102,9 @@ pico_set_program_name(PIOKMbox "PIOKMbox")
 pico_set_program_version(PIOKMbox "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-# UART0 is used for KMBox serial input via RP2350 USB Bridge
-# USB CDC is disabled to avoid breaking HID enumeration
-# Debug output can be sent through the KMBox interface if needed
-pico_enable_stdio_uart(PIOKMbox 1)
+# UART0 is used for KMBox serial input via CH340N / bridge
+# Disable stdio over UART0 so printf logs never collide with KMBox UART protocol or DMA TX
+pico_enable_stdio_uart(PIOKMbox 0)
 pico_enable_stdio_usb(PIOKMbox 0)
 
 # Optimization flags for release performance at 240MHz
@@ -163,7 +162,7 @@ target_compile_definitions(PIOKMbox PRIVATE
         BUILD_CONFIG=BUILD_CONFIG_DEVELOPMENT
         PIO_USB_AVAILABLE=1
         CFG_TUH_RPI_PIO_USB=1
-        CPU_FREQ=240000
+        CPU_FREQ=120000
         KMBOX_UART_INSTANCE=${KMBOX_UART_INSTANCE}
         PIN_USB_HOST_DP=${USB_HOST_DP_PIN}
         PIN_USB_HOST_DM=${USB_HOST_DM_PIN}

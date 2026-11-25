@@ -151,8 +151,10 @@ static bool initialize_system(void) {
     // Add startup delay for cold boot stability
     sleep_ms(200);
     
-    // Overclock RP2350 to 240MHz, increase VREG voltage to 1.25V
-    vreg_set_voltage(VREG_VOLTAGE_1_25);
+    // Keep nominal 1.10V core voltage (VREG_VOLTAGE_1_10) for hardware safety
+    // and set system clock to 120MHz (CPU_FREQ=120000 kHz, multiple of 12MHz for PIO-USB,
+    // within Waveshare RP2350-USB-C 150MHz nominal rating).
+    vreg_set_voltage(VREG_VOLTAGE_1_10);
     sleep_ms(10);  // Let voltage stabilize
     
     if (!set_sys_clock_khz(CPU_FREQ, true)) {

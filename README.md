@@ -56,7 +56,11 @@ PIOKMbox turns an RP2350 board into a transparent man-in-the-middle USB HID devi
 | **Humanization**    | Movement-aware jitter, velocity suppression, overshoot simulation, and Bezier easing — all configurable across four intensity levels. |
 | **Visual Feedback** | Optional ILI9341 TFT display shows real-time latency graphs, connection status, and thermal metrics.                                  |
 
-> **Thermal note:** This firmware runs at 240 MHz+ for optimal performance. Monitor temperature during extended sessions, especially with the TFT display enabled.
+> **Waveshare RP2350-USB-C Safe Build Configuration (`waveshare_rp2350_usb_c`):**
+> - **Clock & Core Voltage:** `120 MHz` (`CPU_FREQ=120000`) at nominal **`1.10 V`** (`VREG_VOLTAGE_1_10`) — within RP2350 datasheet and Waveshare board ratings (overclock/overvoltage removed).
+> - **USB Host (PIO-USB):** Secondary USB-C port on `GPIO12` (D+) and `GPIO13` (D-).
+> - **Serial Control (UART0):** `GPIO0` (TX) and `GPIO1` (RX) at **`115200` baud** (8N1, `stdio_uart` disabled) for direct connection to a 3.3 V USB–UART adapter (e.g., CH340N).
+> - **On-board RGB LED:** WS2812 on `GPIO16` (`PIN_USB_5V`, `PIN_LED`, `NEOPIXEL_POWER`, and `PIN_BUTTON` disabled as `255`).
 
 ---
 

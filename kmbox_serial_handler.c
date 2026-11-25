@@ -273,9 +273,17 @@ static bool uart_send_string(const char *str) {
 
 void kmbox_send_response(const char *response) {
     if (!response) return;
-    uart_send_string(response);
-    uart_send_string("\r\n");
-    // Non-blocking: TX IRQ handles actual transmission
+    size_t len = strlen(response);
+    char buf[256];
+    if (len + 2 <= sizeof(buf)) {
+        memcpy(buf, response, len);
+        buf[len] = '\r';
+        buf[len + 1] = '\n';
+        uart_send_bytes((const uint8_t *)buf, len + 2);
+    } else {
+        uart_send_string(response);
+        uart_send_string("\r\n");
+    }
 }
 
 void kmbox_send_status(const char *message) {
