@@ -58,6 +58,7 @@ bool is_keyboard_connected(void);
 bool usb_hid_is_host_ready(void);
 void usb_hid_clear_pending_reenumeration(void);
 uint8_t usb_hid_get_mirrored_itf_count(void);
+int usb_hid_format_diagnostics(char *buf, size_t buf_size);
 
 // USB stack initialization tracking
 void usb_device_mark_initialized(void);

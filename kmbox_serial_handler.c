@@ -990,7 +990,7 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     // Protocol: KMBOX_INFO — consolidated into ONE single DMA transfer so all
     // diagnostic lines arrive intact at 115200 baud with zero dropped chunks.
     if (len >= 10 && strncmp(line, "KMBOX_INFO", 10) == 0) {
-        char info_buf[512];
+        static char info_buf[768];
         uint16_t vid = get_attached_vid();
         uint16_t pid = get_attached_pid();
         const char *mfr = get_attached_manufacturer();
@@ -1023,6 +1023,10 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
                          (int)SMOOTH_QUEUE_SIZE,
                          (unsigned long)total_inj,
                          (unsigned long)q_overflows);
+        if (n > 0 && (size_t)n + 1 < sizeof(info_buf)) {
+            int d = usb_hid_format_diagnostics(info_buf + n, sizeof(info_buf) - (size_t)n);
+            if (d > 0) n += d;
+        }
         if (n > 0) {
             size_t send_len = ((size_t)n < sizeof(info_buf)) ? (size_t)n : (sizeof(info_buf) - 1);
             uart_send_text_reliable((const uint8_t *)info_buf, send_len);

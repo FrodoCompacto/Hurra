@@ -60,6 +60,7 @@ jobs:
         PICO_SDK_PATH: ${{ github.workspace }}/../../pico-sdk
       run: |
         export PICO_SDK_PATH=$HOME/pico-sdk
+        cp -f pio_usb_overrides/*.c lib/Pico-PIO-USB/src/
         mkdir -p build-${{ matrix.target }}
         cd build-${{ matrix.target }}
         cmake .. \
