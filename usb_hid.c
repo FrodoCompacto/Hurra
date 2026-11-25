@@ -127,7 +127,39 @@ void set_attached_device_vid_pid(uint16_t vid, uint16_t pid) {
     }
 }
 
-void force_usb_reenumeration() {
+#ifdef WAVESHARE_RP2350_USB_C
+static const unsigned first_reconnect_delay_ms = 2000;
+#else
+static const unsigned first_reconnect_delay_ms = 0;
+#endif
+// Owned by Core0. The regular loop keeps servicing UART and watchdogs while waiting.
+static bool first_reconnect_delayed;
+static bool reconnect_waiting;
+static absolute_time_t reconnect_deadline;
+
+static void reconnect_usb_device(void) {
+    // Reconnect with new descriptor
+    usb_trace_mark(TRACE_PC_CONNECT);
+    tud_connect();
+
+    // Wait for reconnection (250ms for stability)
+    // Feed watchdog during wait
+    for (int i = 0; i < 25; i++) {
+        sleep_ms(10);
+        watchdog_core0_heartbeat();
+    }
+}
+
+void usb_reconnect_task(void) {
+    if (reconnect_waiting && time_reached(reconnect_deadline)) {
+        reconnect_waiting = false;
+        reconnect_usb_device();
+    }
+}
+
+void force_usb_reenumeration(void) {
+    if (reconnect_waiting) return;
+
     // Disconnect from USB host
     usb_trace_mark(TRACE_PC_DISCONNECT);
     tud_disconnect();
@@ -139,16 +171,14 @@ void force_usb_reenumeration() {
         watchdog_core0_heartbeat();
     }
     
-    // Reconnect with new descriptor
-    usb_trace_mark(TRACE_PC_CONNECT);
-    tud_connect();
-    
-    // Wait for reconnection (250ms for stability)
-    // Feed watchdog during wait
-    for (int i = 0; i < 25; i++) {
-        sleep_ms(10);
-        watchdog_core0_heartbeat();
+    // Only the first Waveshare reconnect is shifted for the startup timing test.
+    if (first_reconnect_delay_ms && !first_reconnect_delayed) {
+        first_reconnect_delayed = true;
+        reconnect_deadline = make_timeout_time_ms(first_reconnect_delay_ms);
+        reconnect_waiting = true;
+        return;
     }
+    reconnect_usb_device();
 }
 
 static inline void request_device_reenumeration(void) {

@@ -309,6 +309,8 @@ static void main_application_loop(void) {
         // TinyUSB device task - highest priority
         tud_task();
         
+        usb_reconnect_task();
+
         // Initialize DMA after 3 seconds of stable USB operation
         if (!dma_initialized && (current_time - boot_complete_time) > 3000) {
             kmbox_serial_init_dma();
