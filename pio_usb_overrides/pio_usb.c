@@ -5,6 +5,7 @@
 #pragma GCC push_options
 #pragma GCC optimize("-O3")
 
+#include "usb_trace.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h> // memcpy
@@ -244,7 +245,7 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
   }
 
   if (!pio_usb_bus_wait_for_rx_start(pp)) {
-    return -1;
+    return -TRACE_NO_START;
   }
 
   // Timing Critical: use local variable to reduce de-reference
@@ -282,10 +283,19 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
         // Only ACK if crc matches
         if (idx >= 4 && crc_match) {
           if (!pio_usb_bus_usb_transfer(pp, ack_encoded, 5)) {
-            return -1; // ACK handshake failed; device will retry
+            return -TRACE_ACK_TX; // ACK handshake failed; device will retry
           }
           return idx - 4;
         }
+        if (idx == 2 && usb_rx_buffer[0] == USB_SYNC) {
+          if (usb_rx_buffer[1] == USB_PID_NAK) return -TRACE_NAK;
+          if (usb_rx_buffer[1] == USB_PID_STALL) return -TRACE_STALL;
+        }
+        if (idx >= 4 && usb_rx_buffer[0] == USB_SYNC &&
+            (usb_rx_buffer[1] == USB_PID_DATA0 || usb_rx_buffer[1] == USB_PID_DATA1)) {
+          return -TRACE_CRC;
+        }
+        return -TRACE_PACKET;
       } else if (handshake == USB_PID_NAK) {
         pio_usb_bus_usb_transfer(pp, nak_encoded, 5); // best effort
       } else {
@@ -293,7 +303,7 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
       }
       break;
     } else if (get_time_us_32() - start > 7) {
-      return -1; // device is probably unplugged
+      return -TRACE_NO_EOP; // incomplete packet
     }
   }
 

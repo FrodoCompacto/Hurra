@@ -535,6 +535,22 @@ Typical results on Metro RP2350 @ 300 MHz:
 - Review debug logs on GPIO 0/1 @ 115200 baud
 
 **Passthrough not working:**
+
+To inspect a failure after startup, leave the hub and receiver attached during
+boot. After input stops, send `KMBOX_TRACE` followed by a newline on the control
+UART. The trace lives in RAM until the next reset. Reading it is repeatable.
+
+The header shows `live` until an interrupt IN endpoint on a mounted HID device
+has delivered data and then fails three polls in a row. A normal NAK or data
+packet breaks the streak. At the third failure the history freezes. Times are
+milliseconds since boot. Header times of zero mean no event recorded. Event
+rows show the device address and an argument: endpoint address for USB
+transactions, interface instance for HID events, or root port for root connect.
+`no_start` means no receive start was observed, `no_eop` an inter-byte timeout
+before end-of-packet, and `crc` a data packet that failed the CRC check.
+`token_tx` and `ack_tx` identify transmit failures. The trace stores no keycodes
+or mouse coordinates.
+
 - LED should show device connected state
 - Open debug UART to verify device detection
 - Devices with complex HID descriptors may need adjustments

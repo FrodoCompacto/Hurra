@@ -2,6 +2,7 @@
  * Hurricane PIOKMBox Firmware
  */
 
+#include "usb_trace.h"
 #include "usb_hid.h"
 #include "defines.h"
 #include "led_control.h"
@@ -2869,6 +2870,7 @@ void tuh_mount_cb(uint8_t dev_addr)
 
 void tuh_umount_cb(uint8_t dev_addr)
 {
+    usb_trace_event(TRACE_UNMOUNT, dev_addr, 0);
     if (dev_addr == cloned_dev_addr ||
         (cloned_dev_addr == 0 &&
          (dev_addr == connection_state.mouse_dev_addr ||
@@ -2942,6 +2944,7 @@ static inline bool is_report_id_declared(const mirrored_interface_t *mitf, uint8
 
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_report, uint16_t desc_len)
 {
+    usb_trace_event(TRACE_HID_MOUNT, dev_addr, instance);
     // CRITICAL: Snapshot desc_report immediately into a static buffer BEFORE any
     // synchronous EP0 control transfer runs (TinyUSB passes a pointer into its
     // shared enumeration buffer _usbh_epbuf.ctrl, and Core1 has only a 2KB stack).
@@ -3445,6 +3448,8 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
         is_std_kbd = inst_info->is_standard_8byte_kbd;
     }
 
+    uint32_t mouse_before = g_hid_diag_rx_mouse_cnt;
+    uint32_t kbd_before = g_hid_diag_rx_kbd_cnt;
     switch (effective_protocol)
     {
     case HID_ITF_PROTOCOL_KEYBOARD:
@@ -3574,6 +3579,11 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
         }
         break;
     }
+
+    if (g_hid_diag_rx_mouse_cnt != mouse_before)
+        usb_trace_event(TRACE_MOUSE, dev_addr, instance);
+    if (g_hid_diag_rx_kbd_cnt != kbd_before)
+        usb_trace_event(TRACE_KEY, dev_addr, instance);
 
     // Continue to request reports while still mounted
     if (tuh_hid_mounted(dev_addr, instance)) {

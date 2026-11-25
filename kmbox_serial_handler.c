@@ -5,6 +5,7 @@
  * Supports text protocol (M<x>,<y>) and 8-byte binary protocol for low latency.
  */
 
+#include "usb_trace.h"
 #include "kmbox_serial_handler.h"
 #include "lib/kmbox-commands/kmbox_commands.h"
 #include "usb_hid.h"
@@ -983,6 +984,17 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
         };
         if (g_connection_state < 5) {
             kmbox_send_response(responses[g_connection_state]);
+        }
+        return true;
+    }
+
+    if (len == 11 && memcmp(line, "KMBOX_TRACE", 11) == 0) {
+        static char trace_buf[1024];
+        usb_trace_format(trace_buf, sizeof(trace_buf));
+        if (uart_tx_dma_chan >= 0) {
+            uart_send_text_reliable((const uint8_t *)trace_buf, strlen(trace_buf));
+        } else {
+            uart_flush_and_send_blocking(trace_buf);
         }
         return true;
     }

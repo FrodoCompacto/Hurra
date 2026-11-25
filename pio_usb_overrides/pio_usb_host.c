@@ -6,6 +6,7 @@
 #pragma GCC push_options
 #pragma GCC optimize("-O3")
 
+#include "usb_trace.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -336,6 +337,7 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
       port_pin_status_t const line_state = pio_usb_bus_get_line_state(root);
       if (line_state == PORT_PIN_FS_IDLE || line_state == PORT_PIN_LS_IDLE) {
         root->is_fullspeed = (line_state == PORT_PIN_FS_IDLE);
+        usb_trace_event(TRACE_ROOT_CONNECT, 0, root_idx);
         root->connected = true;
         root->suspended = true; // need a bus reset before operating
         root->ints |= PIO_USB_INTS_CONNECT_BITS;
@@ -460,6 +462,8 @@ bool pio_usb_host_endpoint_open(uint8_t root_idx, uint8_t device_address,
       ep->dev_addr = device_address;
       ep->need_pre = need_pre;
       ep->is_tx = (d->epaddr & 0x80) ? false : true; // host endpoint out is tx
+      if ((ep->attr & 3) == EP_ATTR_INTERRUPT && !ep->is_tx)
+        usb_trace_open(ep_pool_idx, device_address, ep->ep_num);
       ep_pool_used_count++;
       return true;
     }
@@ -558,14 +562,22 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
   int res = 0;
   uint8_t expect_pid = (ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
 
+  bool periodic = (ep->attr & 3) == EP_ATTR_INTERRUPT;
+  unsigned slot = ep - PIO_USB_ENDPOINT(0);
   pio_usb_bus_prepare_receive(pp);
   if (!pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num)) {
+    if (periodic) usb_trace_in(slot, TRACE_TOKEN_TX);
     return -1;
   }
   pio_usb_bus_start_receive(pp);
 
   int receive_len = pio_usb_bus_receive_packet_and_handshake(pp, USB_PID_ACK);
   uint8_t const receive_pid = pp->usb_rx_buffer[1];
+
+  if (periodic) {
+    usb_trace_kind_t result = receive_len < 0 ? (usb_trace_kind_t)-receive_len : TRACE_DATA;
+    usb_trace_in(slot, result);
+  }
 
   if (receive_len >= 0) {
     if (receive_pid == expect_pid) {

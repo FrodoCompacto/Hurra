@@ -2,6 +2,7 @@
  * Hurricane PIOKMBox Firmware
 */
 
+#include "usb_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -398,6 +399,7 @@ static void main_application_loop(void) {
 //--------------------------------------------------------------------+
 
 int main(void) {
+    usb_trace_init();
     
     // Initialize basic GPIO (clock will be set by initialize_system)
     #if PIN_USB_5V != 255

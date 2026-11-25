@@ -83,6 +83,7 @@ pico_sdk_init()
 
 add_executable(PIOKMbox
     PIOKMbox.c
+    usb_trace.c
     led_control.c
     usb_hid.c
     watchdog.c
@@ -139,6 +140,13 @@ target_link_libraries(PIOKMbox
 
 # Add PIO USB library
 add_subdirectory(lib/Pico-PIO-USB)
+# Use the same instrumented host driver in local and CI builds.
+get_target_property(pio_sources pico_pio_usb INTERFACE_SOURCES)
+list(REMOVE_ITEM pio_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/Pico-PIO-USB/src/pio_usb.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib/Pico-PIO-USB/src/pio_usb_host.c")
+set_property(TARGET pico_pio_usb PROPERTY INTERFACE_SOURCES "${pio_sources}")
+target_sources(PIOKMbox PRIVATE pio_usb_overrides/pio_usb.c pio_usb_overrides/pio_usb_host.c)
 
 # Add KMBox Commands library
 add_subdirectory(lib/kmbox-commands)
