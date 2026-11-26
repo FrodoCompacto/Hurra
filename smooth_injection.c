@@ -368,44 +368,42 @@ static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
         return false;
     }
     
-    // Fix #3: Apply delivery error (sensor noise simulation)
-    // Small ±1-3% error that the autopilot's feedback loop absorbs naturally
-    if (g_smooth.humanization.delivery_error_fp > 0) {
-        int32_t error_scale = rng_range_fp(-g_smooth.humanization.delivery_error_fp,
-                                            g_smooth.humanization.delivery_error_fp);
-        x_fp += fp_mul(x_fp, error_scale);
-        y_fp += fp_mul(y_fp, error_scale);
-    }
-    
-    // Calculate how many frames this sub-step should span
+    // Zero-Drift guarantee: do not apply open-loop multiplicative delivery_error_fp,
+    // which previously corrupted total movement distance by ±2-3% and caused
+    // cursor drift away from target desktop buttons.
+
+    // Calculate how many 8ms (125Hz) frames this sub-step should span
     int32_t abs_x = x_fp >= 0 ? x_fp : -x_fp;
     int32_t abs_y = y_fp >= 0 ? y_fp : -y_fp;
     int32_t max_component = abs_x > abs_y ? abs_x : abs_y;
-    
+
     // Variable max_per_frame with ±1 pixel variation per sub-step
-    int32_t max_per_frame_fp = int_to_fp(g_smooth.max_per_frame) + 
+    int32_t base_max = (g_smooth.max_per_frame > 0) ? g_smooth.max_per_frame : 18;
+    int32_t max_per_frame_fp = int_to_fp((int16_t)base_max) +
                                rng_range_fp(-SMOOTH_FP_ONE, SMOOTH_FP_ONE);
-    
+    if (max_per_frame_fp < SMOOTH_FP_ONE) max_per_frame_fp = SMOOTH_FP_ONE;
+
     uint8_t frames = 1;
     if (max_component > max_per_frame_fp) {
-        frames = (uint8_t)((max_component + max_per_frame_fp - 1) / max_per_frame_fp);
-        
-        // FPU inline frame spread calculation (no LUT)
-        float movement_px = (float)max_component / SMOOTH_FP_ONE;
-        float multiplier;
-        if (movement_px < 20.0f)
-            multiplier = 1.3f - (movement_px / 20.0f) * 0.1f;
-        else if (movement_px < 60.0f)
-            multiplier = 1.2f - ((movement_px - 20.0f) / 40.0f) * 0.2f;
-        else if (movement_px < 100.0f)
-            multiplier = 1.0f - ((movement_px - 60.0f) / 40.0f) * 0.2f;
-        else if (movement_px < 140.0f)
-            multiplier = 0.8f - ((movement_px - 100.0f) / 40.0f) * 0.1f;
-        else
-            multiplier = 0.7f;
-        
-        frames = (uint8_t)(frames * multiplier);
-        if (frames < 1) frames = 1;
+        uint32_t raw_frames = (uint32_t)((max_component + max_per_frame_fp - 1) / max_per_frame_fp);
+
+        // Fitts-aware frame spread for 125Hz (8ms) frames:
+        // Small streaming steps (<20px) stay nimble (1-3 frames),
+        // while standalone macro jumps expand smoothly to natural human durations.
+        float movement_px = (float)max_component / (float)SMOOTH_FP_ONE;
+        float multiplier = 1.0f;
+        if (movement_px < 20.0f) {
+            multiplier = 1.15f;
+        } else if (movement_px < 80.0f) {
+            multiplier = 1.25f;
+        } else {
+            multiplier = 1.35f;
+        }
+
+        uint32_t scaled = (uint32_t)((float)raw_frames * multiplier + 0.5f);
+        if (scaled < 1u) scaled = 1u;
+        if (scaled > 80u) scaled = 80u;
+        frames = (uint8_t)scaled;
     }
     
     // Add natural latency jitter (0-1 frame)
@@ -642,15 +640,27 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
         overshoot_y_fp = (y_fp > 0) ? overshoot_mag : ((y_fp < 0) ? -overshoot_mag : 0);
     }
     
-    // Queue each sub-step with staggered delays
+    // Queue each sub-step with staggered delays and a Zero-Drift biomechanical wrist arc.
+    // Because the final sub-step uses the exact remainder (x_remaining, y_remaining),
+    // any perpendicular arc deflection added to early sub-steps is 100% cancelled out
+    // at the destination — producing a natural curved trajectory with zero position drift.
     int32_t x_remaining = x_fp;
     int32_t y_remaining = y_fp;
     uint8_t cumulative_delay = 0;
     bool all_ok = true;
-    
+
+    // Perpendicular vector to total displacement: (-y, x)
+    int32_t perp_x_fp = -y_fp;
+    int32_t perp_y_fp = x_fp;
+    int32_t arc_sign = ((rng_next() & 1u) != 0u) ? 1 : -1;
+    // Lateral arc amplitude: 4.5%..7.5% of displacement for standalone movements >= 24px
+    int32_t arc_factor_fp = (movement_px >= 24)
+                          ? (arc_sign * rng_range_fp(SMOOTH_FP_ONE * 45 / 1000, SMOOTH_FP_ONE * 75 / 1000))
+                          : 0;
+
     for (uint8_t i = 0; i < num_substeps; i++) {
         int32_t step_x, step_y;
-        
+
         if (i == num_substeps - 1) {
             // Final sub-step: use exact remainder to prevent any drift
             step_x = x_remaining;
@@ -658,6 +668,11 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
         } else {
             step_x = fp_mul(x_fp, ratios[i]);
             step_y = fp_mul(y_fp, ratios[i]);
+            if (arc_factor_fp != 0 && i == 0) {
+                // Deflect outward on the initial sub-step; final remainder naturally arcs back
+                step_x += fp_mul(perp_x_fp, arc_factor_fp);
+                step_y += fp_mul(perp_y_fp, arc_factor_fp);
+            }
             x_remaining -= step_x;
             y_remaining -= step_y;
         }
@@ -756,12 +771,21 @@ void __not_in_flash_func(smooth_process_frame)(int16_t *out_x, int16_t *out_y) {
         }
         
         if (entry->frames_left > 0) {
-            // Linear progress: equal fraction per frame (IIR filter handles smoothing)
+            // Minimum-jerk bell-shaped velocity progress:
+            // Cumulative position s(u) = 10u^3 - 15u^4 + 6u^5 for u in [0, 1].
+            // Delta for frame k (1..N) is s(k/N) - s((k-1)/N), which telescopes to exactly 1.0.
             int32_t progress_delta;
             if (entry->total_frames <= 1) {
                 progress_delta = SMOOTH_FP_ONE;
             } else {
-                progress_delta = SMOOTH_FP_ONE / entry->total_frames;
+                float inv_n = 1.0f / (float)entry->total_frames;
+                uint8_t step_idx = (uint8_t)(entry->total_frames - entry->frames_left + 1u);
+                float u1 = (float)step_idx * inv_n;
+                float u0 = (float)(step_idx - 1u) * inv_n;
+                float s1 = u1 * u1 * u1 * (10.0f + u1 * (-15.0f + 6.0f * u1));
+                float s0 = u0 * u0 * u0 * (10.0f + u0 * (-15.0f + 6.0f * u0));
+                progress_delta = (int32_t)((s1 - s0) * (float)SMOOTH_FP_ONE);
+                if (progress_delta < 0) progress_delta = 0;
             }
             
             // === MOVEMENT DELTA (tracked - affects remaining) ===
@@ -1054,25 +1078,23 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
             break;
 
         case HUMANIZATION_FULL:
-            // Full humanization — for raw/robotic input
-            // Subdivision, IIR velocity filter, onset delay, overshoot — the works
-            g_smooth.max_per_frame = (int16_t)rng_range(10000, 12000);   // High-DPI: ~650 IPS at 26000 DPI
+            // Full humanization — calibrated for 125Hz (8ms) desktop mouse & button clicking:
+            // Zero-drift subdivision with wrist arc, Minimum-Jerk bell curve, IIR velocity filter.
+            g_smooth.max_per_frame = 18;                                // Desktop default (~18 counts per 8ms frame)
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
-            g_smooth.humanization.jitter_amount_fp = int_to_fp(1);      // 1.0px base tremor
-            g_smooth.humanization.overshoot_chance = 10;                // 10% chance
-            g_smooth.humanization.overshoot_max_fp = int_to_fp(2);      // max 2px
-            g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 4));
+            g_smooth.humanization.jitter_amount_fp = int_to_fp(1);      // 1.0px base (scaled to 0.38x zero-drift)
+            g_smooth.humanization.overshoot_chance = 8;                 // 8% subtle self-correcting overshoot
+            g_smooth.humanization.overshoot_max_fp = int_to_fp(2);      // max 2px (always corrected back)
+            g_smooth.humanization.vel_slow_threshold_fp = int_to_fp(rng_range(1, 3));
             g_smooth.humanization.vel_fast_threshold_fp = int_to_fp(rng_range(8, 14));
-            g_smooth.humanization.delivery_error_fp = SMOOTH_FP_ONE / 50;  // ±2%
-            g_smooth.humanization.accum_clamp_fp = int_to_fp(12000);     // Matches max_per_frame,
-                                                                        // lets accumulator drain naturally
-                                                                        // when queue overflow dumps to accum
-            g_smooth.humanization.onset_jitter_min = 1;                 // 1-4 frames
-            g_smooth.humanization.onset_jitter_max = 4;
-            g_smooth.humanization.vel_filter_alpha_min_fp = SMOOTH_FP_ONE * 50 / 100;  // 0.50 — near-passthrough
-            g_smooth.humanization.vel_filter_alpha_max_fp = SMOOTH_FP_ONE * 90 / 100;  // 0.90 — near-instant
-            g_smooth.humanization.vel_filter_accel_sens_fp = SMOOTH_FP_ONE * 25 / 100; // 0.25
+            g_smooth.humanization.delivery_error_fp = 0;                // 0% open-loop error (100% position conservation)
+            g_smooth.humanization.accum_clamp_fp = int_to_fp(12000);
+            g_smooth.humanization.onset_jitter_min = 0;                 // Responsive start
+            g_smooth.humanization.onset_jitter_max = 1;
+            g_smooth.humanization.vel_filter_alpha_min_fp = SMOOTH_FP_ONE * 45 / 100;  // 0.45 smooth release
+            g_smooth.humanization.vel_filter_alpha_max_fp = SMOOTH_FP_ONE * 85 / 100;  // 0.85 responsive peak
+            g_smooth.humanization.vel_filter_accel_sens_fp = SMOOTH_FP_ONE * 22 / 100; // 0.22
             break;
             
         default:

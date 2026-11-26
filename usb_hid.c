@@ -831,115 +831,107 @@ static __force_inline int8_t clamp_i8(int32_t val) {
  * @param injected_x The injected/synthetic X component (smooth queue + kmbox serial)
  * @param injected_y The injected/synthetic Y component (smooth queue + kmbox serial)
  */
+// Zero-drift micro-tremor compensation state:
+// Any sub-pixel/perpendicular tremor count injected during an active synthetic
+// movement is tracked here and paid back before the movement finishes so the
+// net displacement delivered to the OS is 100% exact (zero position drift).
+static int16_t g_tremor_debt_x = 0;
+static int16_t g_tremor_debt_y = 0;
+
+void usb_hid_reset_tremor_debt(void) {
+    g_tremor_debt_x = 0;
+    g_tremor_debt_y = 0;
+}
+
 static void apply_output_humanization(int16_t *x, int16_t *y, int16_t injected_x, int16_t injected_y) {
     // Skip if humanization is completely disabled
     humanization_mode_t mode = smooth_get_humanization_mode();
     if (mode == HUMANIZATION_OFF) {
+        g_tremor_debt_x = 0;
+        g_tremor_debt_y = 0;
         return;
     }
-    
+
     // Get humanization parameters from smooth injection state
     int32_t jitter_amount_fp;
     bool jitter_enabled;
     smooth_get_humanization_params(&jitter_amount_fp, &jitter_enabled);
-    
+
     if (!jitter_enabled) {
+        g_tremor_debt_x = 0;
+        g_tremor_debt_y = 0;
         return;
     }
-    
-    // --- Calculate blend ratio: how much of this movement is synthetic? ---
-    // If there's no injected component, the user is just moving their mouse.
-    // Human movement is already human — don't add tremor to it.
+
+    // If there is no synthetic movement in this frame, do not touch physical input.
+    if (injected_x == 0 && injected_y == 0) {
+        return;
+    }
+
+    // If the smooth queue is almost finished (or this is the final draining frame),
+    // pay back any accumulated tremor debt so total displacement is conserved 100%.
+    if (!smooth_has_pending()) {
+        *x = (int16_t)(*x - g_tremor_debt_x);
+        *y = (int16_t)(*y - g_tremor_debt_y);
+        g_tremor_debt_x = 0;
+        g_tremor_debt_y = 0;
+        return;
+    }
+
     float inject_mag = sqrtf((float)injected_x * injected_x + (float)injected_y * injected_y);
-    
-    // No injected movement — nothing to humanize. Do NOT apply tremor.
-    // This prevents phantom tremor after injection queue drains (the "shaking" bug).
-    if (inject_mag < 0.5f) {
+    if (inject_mag < 2.5f) {
+        // Near the end of the movement (homing phase): gradually pay back debt
+        // instead of adding new tremor so the cursor settles smoothly on the target.
+        int16_t pay_x = (g_tremor_debt_x > 0) ? 1 : ((g_tremor_debt_x < 0) ? -1 : 0);
+        int16_t pay_y = (g_tremor_debt_y > 0) ? 1 : ((g_tremor_debt_y < 0) ? -1 : 0);
+        *x = (int16_t)(*x - pay_x);
+        *y = (int16_t)(*y - pay_y);
+        g_tremor_debt_x = (int16_t)(g_tremor_debt_x - pay_x);
+        g_tremor_debt_y = (int16_t)(g_tremor_debt_y - pay_y);
         return;
     }
-    
-    float total_mag  = sqrtf((float)(*x) * (*x) + (float)(*y) * (*y));
-    
-    // No movement at all — skip (don't generate idle tremor on pure physical idle)
-    if (total_mag < 0.5f && inject_mag < 0.5f) {
-        return;
-    }
-    
-    // Blend ratio: 0.0 = pure physical, 1.0 = pure injected
-    float blend;
-    if (total_mag < 0.5f) {
-        // Total is ~zero but inject is non-zero (rare edge: physical cancelled inject)
-        blend = 1.0f;
-    } else {
-        blend = inject_mag / total_mag;
-        // Clamp to [0, 1] — inject_mag can exceed total_mag if they oppose
-        if (blend > 1.0f) blend = 1.0f;
-    }
-    
-    // If movement is almost entirely physical, skip tremor entirely
-    // This threshold avoids wasting FPU cycles for negligible tremor
-    if (blend < 0.05f) {
-        return;
-    }
-    
-    // --- Calculate tremor magnitude ---
-    float magnitude = total_mag;
-    
-    // Mode-dependent intensity scaling
-    // MICRO was 0.5x which, combined with 0.5px base jitter, gave only 0.25px
-    // effective tremor — too small to survive even stochastic rounding consistently.
-    float mode_scale = 1.0f;
-    switch (mode) {
-        case HUMANIZATION_MICRO:
-            mode_scale = 0.75f;
-            break;
-        case HUMANIZATION_FULL:
-            mode_scale = 1.0f;
-            break;
-        default:
-            break;
-    }
-    
-    // Calculate tremor scale with blend factor
-    float movement_scale = humanization_jitter_scale(magnitude);
-    float base_jitter = (float)jitter_amount_fp / 65536.0f;  // Convert from 16.16 fixed-point
-    float tremor_scale = base_jitter * movement_scale * mode_scale * blend;
 
-    // Scale noise DOWN at low velocities to prevent overwhelming the signal.
-    // At 1-2 count deltas, ±1 of tremor is 50-100% perturbation, creating
-    // chaotic scribble instead of smooth slow transitions.
-    // Ramp: 0 at 0px → full at 4px
-    float low_speed_scale = fminf(1.0f, magnitude / 4.0f);
-    tremor_scale *= low_speed_scale;
+    float total_mag = sqrtf((float)(*x) * (*x) + (float)(*y) * (*y));
+    if (total_mag < 2.0f) {
+        return;
+    }
 
-    // Get runtime tremor (layered oscillators + noise)
+    float blend = inject_mag / total_mag;
+    if (blend > 1.0f) blend = 1.0f;
+    if (blend < 0.10f) {
+        return;
+    }
+
+    // Desktop-calibrated subtle perpendicular physiological tremor (0.35x scale)
+    float base_jitter = (float)jitter_amount_fp / 65536.0f;
+    float ramp = fminf(1.0f, (total_mag - 2.0f) / 10.0f);
+    float tremor_scale = base_jitter * 0.38f * ramp * blend;
+
     float tremor_x, tremor_y;
     humanization_get_tremor(tremor_scale, &tremor_x, &tremor_y);
-    
-    if (magnitude > 2.0f) {
-        // Moving cursor: perpendicular + parallel decomposition
-        float fx = (float)(*x);
-        float fy = (float)(*y);
-        float norm_x = fx / magnitude;
-        float norm_y = fy / magnitude;
-        
-        // Perpendicular component (tremor_y) - primary humanization signal
-        float perp_dx = -norm_y * tremor_y;
-        float perp_dy = norm_x * tremor_y;
-        
-        // Parallel component (tremor_x) - speed variation (smaller)
-        float para_dx = norm_x * tremor_x * 0.3f;
-        float para_dy = norm_y * tremor_x * 0.3f;
-        
-        // Apply tremor to output (stochastic rounding so sub-pixel tremor
-        // probabilistically produces visible ±1 counts instead of always 0)
-        *x = (int16_t)(*x + stochastic_round(perp_dx + para_dx));
-        *y = (int16_t)(*y + stochastic_round(perp_dy + para_dy));
-    } else {
-        // Small/idle movement with injection active: apply tremor as raw X/Y
-        *x += stochastic_round(tremor_x);
-        *y += stochastic_round(tremor_y);
-    }
+
+    float fx = (float)(*x);
+    float fy = (float)(*y);
+    float norm_x = fx / total_mag;
+    float norm_y = fy / total_mag;
+
+    // Perpendicular component only (smooth lateral micro-wave without longitudinal stutter)
+    float perp_dx = -norm_y * tremor_y;
+    float perp_dy = norm_x * tremor_y;
+
+    int16_t tx = stochastic_round(perp_dx);
+    int16_t ty = stochastic_round(perp_dy);
+
+    // Pull back toward zero-drift if debt already reached ±2 counts
+    if (g_tremor_debt_x >= 2 && tx > 0) tx = -1;
+    else if (g_tremor_debt_x <= -2 && tx < 0) tx = 1;
+    if (g_tremor_debt_y >= 2 && ty > 0) ty = -1;
+    else if (g_tremor_debt_y <= -2 && ty < 0) ty = 1;
+
+    *x = (int16_t)(*x + tx);
+    *y = (int16_t)(*y + ty);
+    g_tremor_debt_x = (int16_t)(g_tremor_debt_x + tx);
+    g_tremor_debt_y = (int16_t)(g_tremor_debt_y + ty);
 }
 
 // Sensor noise: gaussian-based quantization noise with stochastic rounding.
@@ -2223,7 +2215,12 @@ void kmbox_keyboard_tap(uint8_t modifiers, const uint8_t keycodes[6], uint16_t h
 
     uint16_t dur_ms = hold_ms;
     if (dur_ms == 0) {
-        dur_ms = (uint16_t)(40u + (hid_rng_next() % 25u)); // 40..64ms natural tap
+        // Unimodal bell-shaped key hold duration: sum of 3 uniform [15..33]ms -> 45..99ms (mean ~72ms)
+        uint32_t r = hid_rng_next();
+        uint16_t u1 = 15u + (uint16_t)((r & 0xFFu) % 19u);
+        uint16_t u2 = 15u + (uint16_t)(((r >> 8) & 0xFFu) % 19u);
+        uint16_t u3 = 15u + (uint16_t)(((r >> 16) & 0xFFu) % 19u);
+        dur_ms = (uint16_t)(u1 + u2 + u3);
     }
     if (dur_ms < 15u) dur_ms = 15u;
     if (dur_ms > 2000u) dur_ms = 2000u;
@@ -2441,28 +2438,44 @@ void hid_device_task(void)
     // whenever USB is ready — independent of mouse polling jitter or mouse returns.
     drain_auxiliary_hid_queues();
 
-    // Use cheap microsecond timer for polling with optional jitter.
-    // Real mice have crystal/scheduling jitter; perfectly regular 1ms is detectable.
+    // Use cheap microsecond timer for synthetic polling matched to physical mouse rate.
+    // Office wireless receivers like Logitech MK235/M170 (046D:C534) poll at ~125Hz (8000us).
     static uint32_t start_us = 0;
-    static int32_t jitter_us = 0;  // per-frame jitter offset (set after each send)
+    static int32_t jitter_us = 0;  // per-frame jitter offset (set after each synthetic send)
     uint32_t current_us = time_us_32();
     uint32_t elapsed_us = current_us - start_us;
 
-    // Event-driven fast path: when fresh physical mouse data is available,
-    // bypass the 1ms timer and send ASAP. The USB endpoint readiness
-    // (tud_hid_n_ready check below) naturally throttles us to the PC's
-    // polling rate. This reduces average passthrough latency from ~500μs to ~5μs.
-    bool force_immediate = fresh_mouse_data;
+    // Event-driven fast path: when fresh physical mouse data or a button state change
+    // is pending, bypass the synthetic frame timer and send ASAP (~5us passthrough latency).
+    bool buttons_pending = (kmbox_get_current_buttons() != last_sent_buttons);
+    bool force_immediate = fresh_mouse_data || buttons_pending;
+
+    // Determine base synthetic frame interval in microseconds:
+    // Match cloned physical mouse bInterval when available (e.g., 8ms = 8000us for 125Hz M170),
+    // defaulting to 8000us (125Hz) in HUMANIZATION_FULL so synthetic cadence matches the M170.
+    int32_t base_interval_us = 8000;
+    if (mouse_device_instance < mirrored_itf_count &&
+        mirrored_itfs[mouse_device_instance].active &&
+        mirrored_itfs[mouse_device_instance].ep_in_interval >= 1 &&
+        mirrored_itfs[mouse_device_instance].ep_in_interval <= 16) {
+        uint8_t ep_ms = mirrored_itfs[mouse_device_instance].ep_in_interval;
+        // Logitech 046D:C534 reports at ~125Hz (8ms) in practice even if bInterval is 2..8ms
+        base_interval_us = (attached_vid == 0x046D && attached_pid == 0xC534)
+                         ? 8000
+                         : (int32_t)ep_ms * 1000;
+        if (base_interval_us < 1000) base_interval_us = 1000;
+    }
 
     if (!force_immediate) {
-        // CRITICAL: Signed arithmetic to avoid uint32 wrap when jitter is negative.
-        int32_t interval_signed = (int32_t)(HID_DEVICE_TASK_INTERVAL_MS * 1000) + jitter_us;
-        if (interval_signed < 500) interval_signed = 500;
-        if (interval_signed > 2500) interval_signed = 2500;
+        int32_t min_us = base_interval_us / 2;
+        int32_t max_us = base_interval_us + (base_interval_us / 2);
+        int32_t interval_signed = base_interval_us + jitter_us;
+        if (interval_signed < min_us) interval_signed = min_us;
+        if (interval_signed > max_us) interval_signed = max_us;
 
         if (elapsed_us < (uint32_t)interval_signed)
         {
-            return; // Not enough time elapsed
+            return; // Not enough time elapsed for next synthetic frame
         }
     }
     start_us = current_us;
@@ -2481,6 +2494,7 @@ void hid_device_task(void)
         // Clear fresh data signal — if Core1 sets it between here and the
         // drain, the data is still in the accumulators and will be caught
         // on the next iteration (tud_hid_n_ready gates re-entry anyway).
+        bool was_physical_event = fresh_mouse_data;
         fresh_mouse_data = false;
 
         // Cache humanization mode for this frame — avoid 3 function calls per frame
@@ -2508,47 +2522,10 @@ void hid_device_task(void)
             y += smooth_y;
         }
 
-        // Apply output-stage humanization (tremor).
-        // Physical mouse movement is already human; only humanize the
-        // synthetic (smooth injection + bridge) portion.
-        if (!connection_state.mouse_connected) {
-            // No physical mouse — everything is synthetic, full humanization
-            apply_output_humanization(&x, &y, x, y);
-        } else {
-            // Physical mouse connected — only humanize the smooth injection part
-            if (smooth_x != 0 || smooth_y != 0) {
-                apply_output_humanization(&x, &y, smooth_x, smooth_y);
-            }
-        }
-
-        // All output-stage noise is scaled by movement magnitude to prevent
-        // overwhelming low-speed signals.  At 1-2 counts, ±1 noise is 50-100%
-        // perturbation, creating chaotic scribble.
-        if (frame_human_mode != HUMANIZATION_OFF &&
-            (x != 0 || y != 0)) {
-            float out_mag = sqrtf((float)x * x + (float)y * y);
-            float noise_gate = fminf(1.0f, out_mag / 4.0f);  // ramp 0→1 over [0,4]px
-
-            // Sub-pixel quantization noise: real sensors accumulate fractional
-            // pixel residuals that occasionally leak as ±1 count perturbations.
-            // Accumulator stddev 0.45 → crosses ±1 roughly every 3-5 frames
-            // during fast movement, producing 3-8% sub-pixel noise.
-            static float subpx_accum_x = 0.0f;
-            static float subpx_accum_y = 0.0f;
-            float subpx_noise = 0.45f * noise_gate;
-            subpx_accum_x += hid_rng_gaussian() * subpx_noise;
-            subpx_accum_y += hid_rng_gaussian() * subpx_noise;
-            if (subpx_accum_x >= 1.0f) { x += 1; subpx_accum_x -= 1.0f; }
-            else if (subpx_accum_x <= -1.0f) { x -= 1; subpx_accum_x += 1.0f; }
-            if (subpx_accum_y >= 1.0f) { y += 1; subpx_accum_y -= 1.0f; }
-            else if (subpx_accum_y <= -1.0f) { y -= 1; subpx_accum_y += 1.0f; }
-
-            // Sensor noise: gaussian-based, also scaled by magnitude.
-            // Only apply when movement is large enough that noise won't dominate.
-            if (noise_gate > 0.25f) {
-                x = apply_sensor_noise(x);
-                y = apply_sensor_noise(y);
-            }
+        // Apply zero-drift output-stage humanization ONLY to synthetic movement.
+        // Physical mouse movement (M170 passthrough) is 100% untouched.
+        if (has_smooth || ( smooth_x != 0 || smooth_y != 0 )) {
+            apply_output_humanization(&x, &y, smooth_x, smooth_y);
         }
 
         // Send if there's any movement, wheel, OR button state to report.
@@ -2577,14 +2554,8 @@ void hid_device_task(void)
             last_sent_buttons = buttons;
             was_active = true;
 
-            // Compute next frame's timing jitter.
-            // Always jitter when humanization is active — perfectly regular 1ms
-            // intervals are a fingerprint regardless of physical mouse state.
-            // Real USB polling has crystal oscillator drift + OS scheduling jitter.
-            if (frame_human_mode != HUMANIZATION_OFF) {
-                // Gaussian jitter, stddev ~350us → CV ≈ 0.35 on 1000us base.
-                // Smaller than before to avoid excessive clamping; range is
-                // roughly ±700us (95th percentile), keeping interval in [500, 2000].
+            // Compute next synthetic frame's timing jitter (~350us Gaussian around 8000us for 125Hz).
+            if (!was_physical_event && frame_human_mode != HUMANIZATION_OFF) {
                 jitter_us = (int32_t)(hid_rng_gaussian() * 350.0f);
             } else {
                 jitter_us = 0;

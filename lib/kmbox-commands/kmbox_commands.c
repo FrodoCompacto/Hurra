@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "hardware/sync.h"
+#include "pico/rand.h"
 
 //--------------------------------------------------------------------+
 // Hardware Spinlock for Cross-Core Accumulator Safety
@@ -113,34 +114,40 @@ static void sum_movement_since(uint32_t since_ms, uint32_t now_ms, int32_t *out_
 }
 
 //--------------------------------------------------------------------+
-// Random Number Generation
+// Random Number Generation (Hardware TRNG + Irwin-Hall Bell Distribution)
 //--------------------------------------------------------------------+
 
-// Simple linear congruential generator for random release times
 static uint32_t g_rand_seed = 0x12345678;
+
+static inline uint32_t kmbox_rng_next(void)
+{
+    uint32_t x = g_rand_seed ^ get_rand_32();
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_rand_seed = x ? x : 0xA53C9E4Du;
+    return g_rand_seed;
+}
 
 static uint32_t get_random_release_time(void)
 {
-    // Update seed
-    g_rand_seed = (g_rand_seed * 1103515245 + 12345) & 0x7FFFFFFF;
-    
-    // Generate random value between RELEASE_MIN_TIME_MS and RELEASE_MAX_TIME_MS
-    uint32_t range = RELEASE_MAX_TIME_MS - RELEASE_MIN_TIME_MS + 1;
-    uint32_t random_offset = (g_rand_seed >> 16) % range;
-    
-    return RELEASE_MIN_TIME_MS + random_offset;
+    // Unimodal bell-shaped post-release cooldown: sum of 3 uniform [35..60]ms -> 105..180ms (mean ~142ms)
+    uint32_t r = kmbox_rng_next();
+    uint32_t u1 = 35u + ((r & 0xFFu) % 26u);
+    uint32_t u2 = 35u + (((r >> 8) & 0xFFu) % 26u);
+    uint32_t u3 = 35u + (((r >> 16) & 0xFFu) % 26u);
+    return u1 + u2 + u3;
 }
 
 static uint32_t get_random_click_press_time(void)
 {
-    // Update seed
-    g_rand_seed = (g_rand_seed * 1103515245 + 12345) & 0x7FFFFFFF;
-    
-    // Generate random value between CLICK_PRESS_MIN_TIME_MS and CLICK_PRESS_MAX_TIME_MS
-    uint32_t range = CLICK_PRESS_MAX_TIME_MS - CLICK_PRESS_MIN_TIME_MS + 1;
-    uint32_t random_offset = (g_rand_seed >> 16) % range;
-    
-    return CLICK_PRESS_MIN_TIME_MS + random_offset;
+    // Unimodal bell-shaped human finger click hold duration:
+    // Sum of 3 independent uniform [22..43]ms values -> range [66..129]ms, mean ~97.5ms, stddev ~11ms
+    uint32_t r = kmbox_rng_next();
+    uint32_t u1 = 22u + ((r & 0xFFu) % 22u);
+    uint32_t u2 = 22u + (((r >> 8) & 0xFFu) % 22u);
+    uint32_t u3 = 22u + (((r >> 16) & 0xFFu) % 22u);
+    return u1 + u2 + u3;
 }
 
 //--------------------------------------------------------------------+
@@ -790,9 +797,9 @@ void kmbox_commands_init(void)
     memset(&g_kmbox_state, 0, sizeof(g_kmbox_state));
     memset(&g_parser, 0, sizeof(g_parser));
     
-    // Initialize random seed with a better value if available
-    // For now, using a fixed seed for reproducibility
-    g_rand_seed = 0x12345678;
+    // Initialize random seed from RP2350 hardware TRNG
+    uint32_t hw_seed = get_rand_32();
+    g_rand_seed = hw_seed ? hw_seed : 0xA53C9E4Du;
     
     // Initialize button callback state
     g_kmbox_state.button_callback_enabled = false;
