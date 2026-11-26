@@ -152,7 +152,7 @@ All are git submodules with their own CMakeLists.txt:
 
 ### Build Configuration Presets
 
-Set via `BUILD_CONFIG` compile definition in CMake (default: `BUILD_CONFIG_DEVELOPMENT`):
+Set `HURRA_BUILD_CONFIG` in CMake to override the firmware profile. Waveshare defaults to `BUILD_CONFIG_PRODUCTION` and other boards default to `BUILD_CONFIG_DEVELOPMENT`.
 - `BUILD_CONFIG_DEVELOPMENT` — verbose logging
 - `BUILD_CONFIG_PRODUCTION` — optimized, higher retry counts, longer stabilization delays
 - `BUILD_CONFIG_TESTING` — minimal delays, fast iteration

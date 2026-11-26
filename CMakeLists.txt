@@ -68,6 +68,13 @@ else()
     message(STATUS "Configuring for ${PICO_BOARD} - USB Host on GPIO16/17")
 endif()
 
+if(PICO_BOARD STREQUAL "waveshare_rp2350_usb_c")
+    set(default_build_config BUILD_CONFIG_PRODUCTION)
+else()
+    set(default_build_config BUILD_CONFIG_DEVELOPMENT)
+endif()
+set(HURRA_BUILD_CONFIG ${default_build_config} CACHE STRING "Firmware profile from defines.h")
+
 # UART instance: 0 = uart0 (GPIO 0/1), 1 = uart1 (GPIO 8/9)
 set(KMBOX_UART_INSTANCE 0 CACHE STRING "UART instance for bridge communication (0 or 1)")
 
@@ -83,7 +90,6 @@ pico_sdk_init()
 
 add_executable(PIOKMbox
     PIOKMbox.c
-    usb_trace.c
     led_control.c
     usb_hid.c
     watchdog.c
@@ -95,17 +101,6 @@ add_executable(PIOKMbox
     xbox_host.c
     xbox_device.c
 )
-
-# Refresh the serial diagnostic ID on incremental builds as well as CI builds.
-set(build_id_header "${CMAKE_CURRENT_BINARY_DIR}/hurra_build_id.h")
-add_custom_target(hurra_build_id
-    COMMAND ${CMAKE_COMMAND} "-DOUTPUT=${build_id_header}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_id.cmake"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    BYPRODUCTS "${build_id_header}"
-    VERBATIM)
-add_dependencies(PIOKMbox hurra_build_id)
-target_include_directories(PIOKMbox PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # generate the header file into the source tree as it is included in the RP2040 datasheet
 pico_generate_pio_header(PIOKMbox ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR})
@@ -151,7 +146,7 @@ target_link_libraries(PIOKMbox
 
 # Add PIO USB library
 add_subdirectory(lib/Pico-PIO-USB)
-# Use the same instrumented host driver in local and CI builds.
+# Use the same patched host driver in local and CI builds.
 get_target_property(pio_sources pico_pio_usb INTERFACE_SOURCES)
 list(REMOVE_ITEM pio_sources
     "${CMAKE_CURRENT_SOURCE_DIR}/lib/Pico-PIO-USB/src/pio_usb.c"
@@ -178,7 +173,7 @@ target_compile_definitions(PIOKMbox PRIVATE
         BOARD_TUH_RHPORT=1
         BOARD_TUD_RHPORT=0
         PIO_USB_USE_TINYUSB
-        BUILD_CONFIG=BUILD_CONFIG_DEVELOPMENT
+        BUILD_CONFIG=${HURRA_BUILD_CONFIG}
         PIO_USB_AVAILABLE=1
         CFG_TUH_RPI_PIO_USB=1
         CPU_FREQ=120000

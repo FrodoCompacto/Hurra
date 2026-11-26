@@ -6,7 +6,6 @@
 #pragma GCC push_options
 #pragma GCC optimize("-O3")
 
-#include "usb_trace.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,8 +28,6 @@ static repeating_timer_t sof_rt;
 // The sof_count may be incremented and then read on different cores.
 static volatile uint32_t sof_count = 0;
 static bool timer_active;
-static uint32_t frame_started_us, frame_gap_us;
-static bool frame_token_sent[PIO_USB_ROOT_PORT_CNT];
 
 static volatile bool cancel_timer_flag;
 static volatile bool start_timer_flag;
@@ -263,13 +260,9 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
 
   pio_port_t *pp = PIO_USB_PIO_PORT(0);
 
-  uint32_t now = get_time_us_32();
-  frame_gap_us = now - frame_started_us;
-  frame_started_us = now;
   // Send SOF
   for (int root_idx = 0; root_idx < PIO_USB_ROOT_PORT_CNT; root_idx++) {
     root_port_t *root = PIO_USB_ROOT_PORT(root_idx);
-    frame_token_sent[root_idx] = false;
     if (!(root->initialized && root->connected && !root->suspended &&
           connection_check(root))) {
       continue;
@@ -277,10 +270,10 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
     configure_root_port(pp, root);
     if (root->is_fullspeed) {
       // Send SOF for full speed
-      frame_token_sent[root_idx] = pio_usb_bus_usb_transfer(pp, sof_packet_encoded, sof_packet_encoded_len);
+      pio_usb_bus_usb_transfer(pp, sof_packet_encoded, sof_packet_encoded_len);
     } else {
       // Send Keep alive for low speed
-      frame_token_sent[root_idx] = pio_usb_bus_usb_transfer(pp, keepalive_encoded, 1);
+      pio_usb_bus_usb_transfer(pp, keepalive_encoded, 1);
     }
   }
 
@@ -343,7 +336,6 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
       port_pin_status_t const line_state = pio_usb_bus_get_line_state(root);
       if (line_state == PORT_PIN_FS_IDLE || line_state == PORT_PIN_LS_IDLE) {
         root->is_fullspeed = (line_state == PORT_PIN_FS_IDLE);
-        usb_trace_event(TRACE_ROOT_CONNECT, 0, root_idx);
         root->connected = true;
         root->suspended = true; // need a bus reset before operating
         root->ints |= PIO_USB_INTS_CONNECT_BITS;
@@ -430,7 +422,6 @@ void pio_usb_host_close_device(uint8_t root_idx, uint8_t device_address) {
     endpoint_t *ep = PIO_USB_ENDPOINT(ep_pool_idx);
     if ((ep->root_idx == root_idx) && (ep->dev_addr == device_address) &&
         ep->size) {
-      usb_trace_close(ep_pool_idx);
       ep->size = 0;
       ep->has_transfer = false;
       if (ep_pool_used_count > 0) ep_pool_used_count--;
@@ -469,8 +460,6 @@ bool pio_usb_host_endpoint_open(uint8_t root_idx, uint8_t device_address,
       ep->dev_addr = device_address;
       ep->need_pre = need_pre;
       ep->is_tx = (d->epaddr & 0x80) ? false : true; // host endpoint out is tx
-      if ((ep->attr & 3) == EP_ATTR_INTERRUPT && !ep->is_tx)
-        usb_trace_open(ep_pool_idx, device_address, ep->ep_num);
       ep_pool_used_count++;
       return true;
     }
@@ -488,7 +477,6 @@ bool pio_usb_host_endpoint_close(uint8_t root_idx, uint8_t device_address,
     return false; // endpoint not opened
   }
 
-  usb_trace_close(ep - PIO_USB_ENDPOINT(0));
   ep->size = 0; // mark as closed
   if (ep_pool_used_count > 0) ep_pool_used_count--;
   return true;
@@ -565,41 +553,13 @@ bool pio_usb_host_endpoint_abort_transfer(uint8_t root_idx, uint8_t device_addre
 // Transaction helper
 //--------------------------------------------------------------------+
 
-// Sample after the handshake or timeout. Never drain the FIFO or change pad
-// enables for diagnostics. The PIO host inverts both GPIO inputs.
-static void __not_in_flash_func(trace_poll)(pio_port_t *pp, endpoint_t *ep,
-                                            uint32_t start, usb_trace_kind_t result) {
-  root_port_t *root = PIO_USB_ROOT_PORT(ep->root_idx);
-  uint32_t us = get_time_us_32();
-  uint32_t oe = pp->pio_usb_tx->dbg_padoe;
-  uint32_t enabled = pp->pio_usb_rx->ctrl;
-  usb_bus_sample_t sample = {
-    .us = us, .frame = sof_count, .frame_gap_us = frame_gap_us, .elapsed_us = us - start,
-    .irq = pp->pio_usb_rx->irq & IRQ_RX_ALL_MASK,
-    .fifo = pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx),
-    .rx_pc = pp->pio_usb_rx->sm[pp->sm_rx].addr - pp->offset_rx,
-    .edge_pc = pp->pio_usb_rx->sm[pp->sm_eop].addr - pp->offset_eop,
-    .tx_pc = pp->pio_usb_tx->sm[pp->sm_tx].addr - pp->offset_tx,
-    .rx_enabled = (enabled >> pp->sm_rx) & 1u, .edge_enabled = (enabled >> pp->sm_eop) & 1u,
-    .tx_oe = ((oe >> (root->pin_dp & 31)) & 1u) | (((oe >> (root->pin_dm & 31)) & 1u) << 1),
-    .pid_byte = pp->usb_rx_buffer[1],
-    .dp = !gpio_get(root->pin_dp), .dm = !gpio_get(root->pin_dm),
-    .sof_sent = frame_token_sent[ep->root_idx], .low_speed = pp->low_speed,
-    .pre = ep->need_pre, .result = result
-  };
-  usb_trace_in(ep - PIO_USB_ENDPOINT(0), &sample);
-}
-
 static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
                                                              endpoint_t *ep) {
   int res = 0;
   uint8_t expect_pid = (ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
 
-  bool periodic = (ep->attr & 3) == EP_ATTR_INTERRUPT;
-  uint32_t poll_start = periodic ? get_time_us_32() : 0;
   pio_usb_bus_prepare_receive(pp);
   if (!pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num)) {
-    if (periodic) trace_poll(pp, ep, poll_start, TRACE_TOKEN_TX);
     return -1;
   }
   pio_usb_bus_start_receive(pp);
@@ -607,15 +567,8 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
   int receive_len = pio_usb_bus_receive_packet_and_handshake(pp, USB_PID_ACK);
   uint8_t const receive_pid = pp->usb_rx_buffer[1];
 
-  if (periodic) {
-    usb_trace_kind_t result = receive_len < 0 ? (usb_trace_kind_t)-receive_len : TRACE_DATA;
-    trace_poll(pp, ep, poll_start, result);
-  }
-
   if (receive_len >= 0) {
     if (receive_pid == expect_pid) {
-      if (ep->ep_num == 0x80 && receive_len == 4)
-        usb_trace_control_in(ep->dev_addr, &pp->usb_rx_buffer[2], receive_len);
       g_pio_usb_in_ok_cnt++;
       memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
       pio_usb_ll_transfer_continue(ep, receive_len);
@@ -729,7 +682,6 @@ static int __no_inline_not_in_flash_func(usb_setup_transaction)(
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, false);
 
   if (handshake == USB_PID_ACK) {
-    usb_trace_setup(ep->dev_addr, ep->app_buf);
     ep->actual_len = 8;
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_COMPLETE_BITS);
   } else {

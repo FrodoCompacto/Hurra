@@ -9,7 +9,7 @@ on:
       release_type:
         description: 'Release type'
         required: true
-        default: 'development'
+        default: 'production'
         type: choice
         options:
           - development
@@ -68,12 +68,12 @@ jobs:
     - name: Determine build config
       id: config
       run: |
-        if [ "${{ github.event.inputs.release_type }}" = "production" ]; then
-          echo "build_config=BUILD_CONFIG_PRODUCTION" >> $GITHUB_OUTPUT
+        if [ "${{ github.event.inputs.release_type }}" = "development" ]; then
+          echo "build_config=BUILD_CONFIG_DEVELOPMENT" >> $GITHUB_OUTPUT
         elif [ "${{ github.event.inputs.release_type }}" = "testing" ]; then
           echo "build_config=BUILD_CONFIG_TESTING" >> $GITHUB_OUTPUT
         else
-          echo "build_config=BUILD_CONFIG_DEVELOPMENT" >> $GITHUB_OUTPUT
+          echo "build_config=BUILD_CONFIG_PRODUCTION" >> $GITHUB_OUTPUT
         fi
 
     - name: Configure and build
@@ -86,7 +86,7 @@ jobs:
           -DPICO_BOARD=${{ matrix.board }} \
           -DPICO_PLATFORM=${{ matrix.platform }} \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_FLAGS="-D${{ steps.config.outputs.build_config }}" \
+          -DHURRA_BUILD_CONFIG="${{ steps.config.outputs.build_config }}" \
           -G Ninja
         ninja
 

@@ -5,9 +5,6 @@
  * Supports text protocol (M<x>,<y>) and 8-byte binary protocol for low latency.
  */
 
-#include "usb_trace.h"
-#include "hurra_build_id.h"
-#include "pio_usb.h"
 #include "kmbox_serial_handler.h"
 #include "lib/kmbox-commands/kmbox_commands.h"
 #include "usb_hid.h"
@@ -1001,31 +998,6 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
         return true;
     }
 
-    bool bus_index = len == 9 && memcmp(line, "KMBOX_BUS", 9) == 0;
-    bool bus_page = (len == 11 || len == 12) && memcmp(line, "KMBOX_BUS ", 10) == 0;
-    if (bus_index || bus_page || (len == 11 && memcmp(line, "KMBOX_TRACE", 11) == 0)) {
-        static char trace_buf[1024];
-        if (bus_index) {
-            usb_trace_bus_index(trace_buf, sizeof(trace_buf), pio_usb_host_get_frame_number(),
-                                watchdog_get_status().core1_heartbeat_count, HURRA_BUILD_ID);
-        } else if (bus_page) {
-            unsigned page = 0;
-            for (size_t i = 10; i < len; i++) {
-                if (line[i] < '0' || line[i] > '9') { page = 100; break; }
-                page = page * 10 + (unsigned)(line[i] - '0');
-            }
-            usb_trace_bus_page(page, trace_buf, sizeof(trace_buf));
-        } else {
-            usb_trace_format(trace_buf, sizeof(trace_buf));
-        }
-        if (uart_tx_dma_chan >= 0) {
-            uart_send_text_reliable((const uint8_t *)trace_buf, strlen(trace_buf));
-        } else {
-            uart_flush_and_send_blocking(trace_buf);
-        }
-        return true;
-    }
-
     // Protocol: KMBOX_INFO — consolidated into ONE single DMA transfer so all
     // diagnostic lines arrive intact at 115200 baud with zero dropped chunks.
     if (len >= 10 && strncmp(line, "KMBOX_INFO", 10) == 0) {
@@ -1179,7 +1151,6 @@ void kmbox_serial_init(void) {
 }
 
 void kmbox_serial_init_dma(void) {
-    usb_trace_mark(TRACE_UART_DMA_INIT);
     // Set up DMA circular buffer for UART RX (zero-CPU reception)
     uart_rx_dma_chan = dma_claim_unused_channel(false);
     if (uart_rx_dma_chan < 0) {
@@ -1206,7 +1177,6 @@ void kmbox_serial_init_dma(void) {
         true                                     // Start immediately
     );
     
-    usb_trace_mark(TRACE_UART_DMA_RX);
     printf("[KMBOX] DMA RX initialized: ch=%d, buf=%u bytes\n", uart_rx_dma_chan, UART_RX_BUFFER_SIZE);
     
     //--------------------------------------------------------------------+
@@ -1245,7 +1215,6 @@ void kmbox_serial_init_dma(void) {
     uart_set_irq_enables(KMBOX_UART, false, false);
     g_uart_tx_buffer.tx_active = false;
     
-    usb_trace_mark(TRACE_UART_DMA_TX_READY);
     printf("[KMBOX] DMA TX initialized: ch=%d, buf=%u bytes\n", uart_tx_dma_chan, DMA_TX_BUFFER_SIZE);
 }
 

@@ -2,7 +2,6 @@
  * Hurricane PIOKMBox Firmware
  */
 
-#include "usb_trace.h"
 #include "usb_hid.h"
 #include "defines.h"
 #include "led_control.h"
@@ -127,49 +126,26 @@ void set_attached_device_vid_pid(uint16_t vid, uint16_t pid) {
     }
 }
 
-#ifdef WAVESHARE_RP2350_USB_C
-// Core0 keeps servicing USB, UART and watchdogs until the first detach is due.
-static bool first_disconnect_scheduled;
-static bool disconnect_waiting;
-static absolute_time_t disconnect_deadline;
-#endif
-
-static void reenumerate_usb_device(void) {
-    usb_trace_mark(TRACE_PC_DISCONNECT);
+void force_usb_reenumeration() {
+    // Disconnect from USB host
     tud_disconnect();
+
+    // Wait for host to recognize disconnection (500ms for Windows/macOS)
+    // Feed watchdog during long wait to prevent reset
     for (int i = 0; i < 50; i++) {
         sleep_ms(10);
         watchdog_core0_heartbeat();
     }
 
-    usb_trace_mark(TRACE_PC_CONNECT);
+    // Reconnect with new descriptor
     tud_connect();
+
+    // Wait for reconnection (250ms for stability)
+    // Feed watchdog during wait
     for (int i = 0; i < 25; i++) {
         sleep_ms(10);
         watchdog_core0_heartbeat();
     }
-}
-
-void usb_reenumeration_task(void) {
-#ifdef WAVESHARE_RP2350_USB_C
-    if (disconnect_waiting && time_reached(disconnect_deadline)) {
-        disconnect_waiting = false;
-        reenumerate_usb_device();
-    }
-#endif
-}
-
-void force_usb_reenumeration(void) {
-#ifdef WAVESHARE_RP2350_USB_C
-    if (disconnect_waiting) return;
-    if (!first_disconnect_scheduled) {
-        first_disconnect_scheduled = true;
-        disconnect_deadline = make_timeout_time_ms(2000);
-        disconnect_waiting = true;
-        return;
-    }
-#endif
-    reenumerate_usb_device();
 }
 
 static inline void request_device_reenumeration(void) {
@@ -1241,7 +1217,6 @@ static volatile uint32_t g_hid_diag_rx_drop_cnt = 0;
 static volatile uint32_t g_hid_diag_rearm_cnt = 0;
 static volatile uint8_t  g_hid_diag_last_itf = 0xFF;
 static volatile uint8_t  g_hid_diag_last_len = 0;
-static volatile uint8_t  g_hid_diag_last_bytes[8] = {0};
 
 static hid_instance_info_t hid_instances[MAX_HID_INSTANCES];
 
@@ -2856,7 +2831,6 @@ void hid_host_task(void)
 // Device callbacks with improved error handling
 void tud_mount_cb(void)
 {
-    usb_trace_mark(TRACE_PC_MOUNT);
     led_set_blink_interval(LED_BLINK_MOUNTED_MS);
     neopixel_update_status();
 }
@@ -2894,7 +2868,6 @@ void tuh_mount_cb(uint8_t dev_addr)
 
 void tuh_umount_cb(uint8_t dev_addr)
 {
-    usb_trace_event(TRACE_UNMOUNT, dev_addr, 0);
     if (dev_addr == cloned_dev_addr ||
         (cloned_dev_addr == 0 &&
          (dev_addr == connection_state.mouse_dev_addr ||
@@ -2968,7 +2941,6 @@ static inline bool is_report_id_declared(const mirrored_interface_t *mitf, uint8
 
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_report, uint16_t desc_len)
 {
-    usb_trace_event(TRACE_HID_MOUNT, dev_addr, instance);
     // CRITICAL: Snapshot desc_report immediately into a static buffer BEFORE any
     // synchronous EP0 control transfer runs (TinyUSB passes a pointer into its
     // shared enumeration buffer _usbh_epbuf.ctrl, and Core1 has only a 2KB stack).
@@ -3452,9 +3424,6 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
     g_hid_diag_rx_cb_cnt++;
     g_hid_diag_last_itf = instance;
     g_hid_diag_last_len = (len > 255) ? 255 : (uint8_t)len;
-    for (uint8_t bi = 0; bi < 8; bi++) {
-        g_hid_diag_last_bytes[bi] = (bi < len) ? report[bi] : 0;
-    }
 
     // Look up effective protocol from per-instance tracking
     uint8_t effective_protocol = tuh_hid_interface_protocol(dev_addr, instance);
@@ -3472,8 +3441,6 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
         is_std_kbd = inst_info->is_standard_8byte_kbd;
     }
 
-    uint32_t mouse_before = g_hid_diag_rx_mouse_cnt;
-    uint32_t kbd_before = g_hid_diag_rx_kbd_cnt;
     switch (effective_protocol)
     {
     case HID_ITF_PROTOCOL_KEYBOARD:
@@ -3604,11 +3571,6 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
         break;
     }
 
-    if (g_hid_diag_rx_mouse_cnt != mouse_before)
-        usb_trace_event(TRACE_MOUSE, dev_addr, instance);
-    if (g_hid_diag_rx_kbd_cnt != kbd_before)
-        usb_trace_event(TRACE_KEY, dev_addr, instance);
-
     // Continue to request reports while still mounted
     if (tuh_hid_mounted(dev_addr, instance)) {
         tuh_hid_receive_report(dev_addr, instance);
@@ -3668,7 +3630,7 @@ int usb_hid_format_diagnostics(char *buf, size_t buf_size)
     return snprintf(buf, buf_size,
                     "KMBOX_PIO:ok=%lu,nak=%lu,err=%lu,mis=%lu,stl=%lu,ep=%u,e0=%02X/%u/%02X/%u,e1=%02X/%u/%02X/%u,e2=%02X/%u/%02X/%u\r\n"
                     "KMBOX_ITF:i0=%u/%u/%u/%u,i1=%u/%u/%u,ml=%u/%u/%u/%u,inst=%u/%u\r\n"
-                    "KMBOX_RX:cb=%lu,k=%lu,m=%lu,v=%lu,drp=%lu,ra=%lu,itf=%u,len=%u,d=%02X%02X%02X%02X%02X%02X%02X%02X\r\n",
+                    "KMBOX_RX:cb=%lu,k=%lu,m=%lu,v=%lu,drp=%lu,ra=%lu,itf=%u,len=%u\r\n",
                     (unsigned long)g_pio_usb_in_ok_cnt,
                     (unsigned long)g_pio_usb_in_nak_cnt,
                     (unsigned long)g_pio_usb_in_err_cnt,
@@ -3693,15 +3655,7 @@ int usb_hid_format_diagnostics(char *buf, size_t buf_size)
                     (unsigned long)g_hid_diag_rx_drop_cnt,
                     (unsigned long)g_hid_diag_rearm_cnt,
                     (unsigned)g_hid_diag_last_itf,
-                    (unsigned)g_hid_diag_last_len,
-                    (unsigned)g_hid_diag_last_bytes[0],
-                    (unsigned)g_hid_diag_last_bytes[1],
-                    (unsigned)g_hid_diag_last_bytes[2],
-                    (unsigned)g_hid_diag_last_bytes[3],
-                    (unsigned)g_hid_diag_last_bytes[4],
-                    (unsigned)g_hid_diag_last_bytes[5],
-                    (unsigned)g_hid_diag_last_bytes[6],
-                    (unsigned)g_hid_diag_last_bytes[7]);
+                    (unsigned)g_hid_diag_last_len);
 }
 
 void tuh_hid_get_report_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t report_id, uint8_t report_type, uint16_t len)

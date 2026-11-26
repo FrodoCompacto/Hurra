@@ -2,7 +2,6 @@
  * Hurricane PIOKMBox Firmware
 */
 
-#include "usb_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -309,8 +308,6 @@ static void main_application_loop(void) {
         // TinyUSB device task - highest priority
         tud_task();
         
-        usb_reenumeration_task();
-
         // Initialize DMA after 3 seconds of stable USB operation
         if (!dma_initialized && (current_time - boot_complete_time) > 3000) {
             kmbox_serial_init_dma();
@@ -401,7 +398,6 @@ static void main_application_loop(void) {
 //--------------------------------------------------------------------+
 
 int main(void) {
-    usb_trace_init();
     
     // Initialize basic GPIO (clock will be set by initialize_system)
     #if PIN_USB_5V != 255
