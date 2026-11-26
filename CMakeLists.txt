@@ -96,6 +96,17 @@ add_executable(PIOKMbox
     xbox_device.c
 )
 
+# Refresh the serial diagnostic ID on incremental builds as well as CI builds.
+set(build_id_header "${CMAKE_CURRENT_BINARY_DIR}/hurra_build_id.h")
+add_custom_target(hurra_build_id
+    COMMAND ${CMAKE_COMMAND} "-DOUTPUT=${build_id_header}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_id.cmake"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    BYPRODUCTS "${build_id_header}"
+    VERBATIM)
+add_dependencies(PIOKMbox hurra_build_id)
+target_include_directories(PIOKMbox PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+
 # generate the header file into the source tree as it is included in the RP2040 datasheet
 pico_generate_pio_header(PIOKMbox ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR})
 
