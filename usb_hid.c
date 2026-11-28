@@ -315,6 +315,9 @@ static struct {
     volatile uint8_t tail;   // Read by Core1 (consumer)
 } set_report_queue;
 
+static volatile bool     g_set_report_busy = false;
+static uint32_t          g_set_report_start_ms = 0;
+
 // Extended string descriptor cache.
 // Gaming mice may use string indices beyond the standard 1-3 (manufacturer,
 // product, serial). Interface strings, HID class strings, etc.
@@ -781,6 +784,7 @@ static void reset_device_string_descriptors(void) {
     // Reset vendor report queues and GET_REPORT cache
     vendor_fwd_queue.head = vendor_fwd_queue.tail = 0;
     set_report_queue.head = set_report_queue.tail = 0;
+    g_set_report_busy = false;
     memset(report_cache, 0, sizeof(report_cache));
     memset(&get_report_bridge, 0, sizeof(get_report_bridge));
 
@@ -1207,6 +1211,8 @@ static volatile uint32_t g_hid_diag_rx_mouse_cnt = 0;
 static volatile uint32_t g_hid_diag_rx_aux_cnt = 0;
 static volatile uint32_t g_hid_diag_rx_drop_cnt = 0;
 static volatile uint32_t g_hid_diag_rearm_cnt = 0;
+static volatile uint32_t g_hid_diag_set_rep_q_cnt = 0;
+static volatile uint32_t g_hid_diag_set_rep_ok_cnt = 0;
 static volatile uint8_t  g_hid_diag_last_itf = 0xFF;
 static volatile uint8_t  g_hid_diag_last_len = 0;
 
@@ -1740,6 +1746,7 @@ bool usb_hid_init(void)
     force_16bit_desc_override = false;
     vendor_fwd_queue.head = vendor_fwd_queue.tail = 0;
     set_report_queue.head = set_report_queue.tail = 0;
+    g_set_report_busy = false;
     memset(report_cache, 0, sizeof(report_cache));
     memset(&get_report_bridge, 0, sizeof(get_report_bridge));
     extra_string_count = 0;
@@ -1924,6 +1931,7 @@ static void handle_hid_device_offline(uint8_t dev_addr)
     attached_vid = 0;
     attached_pid = 0;
     host_hid_ready = false;
+    g_set_report_busy = false;
     checked_runtime_mouse_override = false;
     force_16bit_desc_override = false;
     using_16bit_output_override = false;
@@ -2760,17 +2768,36 @@ void hid_host_task(void)
     poll_hid_host_health();
 
     // Drain SET_REPORT passthrough queue (Core0 → Core1).
-    // Process at most 1 per call — tuh_hid_set_report() may block on USB
-    // control transfer, and draining the full queue could stall Core1's PIO USB.
-    if (set_report_queue.tail != set_report_queue.head) {
-        set_report_entry_t *e = &set_report_queue.entries[set_report_queue.tail];
-        if (tuh_hid_mounted(e->host_dev_addr, e->host_instance)) {
-            tuh_hid_set_report(e->host_dev_addr, e->host_instance,
-                               e->report_id, e->report_type,
-                               (void*)e->data, e->len);
+    // Wait for each asynchronous EP0 control transfer to complete before
+    // advancing tail or starting the next SET_REPORT so back-to-back requests
+    // (e.g. Linux hid-logitech-dj HID++ initialization) are never dropped.
+    if (g_set_report_busy) {
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if ((now_ms - g_set_report_start_ms) >= 50u) {
+            if (set_report_queue.tail != set_report_queue.head) {
+                __dmb();
+                set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
+            }
+            g_set_report_busy = false;
         }
-        __dmb();
-        set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
+    }
+
+    if (!g_set_report_busy && set_report_queue.tail != set_report_queue.head) {
+        set_report_entry_t *e = &set_report_queue.entries[set_report_queue.tail];
+        if (!tuh_hid_mounted(e->host_dev_addr, e->host_instance)) {
+            __dmb();
+            set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
+        } else {
+            g_set_report_busy = true;
+            g_set_report_start_ms = to_ms_since_boot(get_absolute_time());
+            __dmb();
+            if (!tuh_hid_set_report(e->host_dev_addr, e->host_instance,
+                                    e->report_id, e->report_type,
+                                    (void*)e->data, e->len)) {
+                // EP0 control pipe busy — keep entry in queue and retry next tick
+                g_set_report_busy = false;
+            }
+        }
     }
 
     if (get_report_bridge.pending && !get_report_bridge.busy) {
@@ -3022,21 +3049,15 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
 
     mounted_hid_itf_count++;
 
-    // === SANITIZE REPORT DESCRIPTOR & DETERMINE EFFECTIVE PROTOCOL ===
-    // Strip vendor-defined top-level collections (0xFF00..0xFFFF) to avoid
-    // vendor control-channel polling while preserving Mouse, Consumer Control,
-    // and System Control collections.
+    // === PRESERVE FULL REPORT DESCRIPTOR & DETERMINE EFFECTIVE PROTOCOL ===
+    // Preserve vendor-defined collections (0xFF00..0xFFFF, such as Logitech HID++
+    // Report IDs 0x10 and 0x11 on 046D:C534 MI_01) so the Linux hid-logitech-dj
+    // driver can detect the HID++ collection (0xff000001), query paired devices
+    // via SET_REPORT(0x10), and receive pairing notifications from the receiver.
+    (void)strip_vendor_collections;
+    (void)s_mount_cleaned_desc;
     const uint8_t *effective_desc = saved_desc;
     uint16_t effective_desc_len = saved_desc_len;
-
-    if (saved_desc != NULL && saved_desc_len > 0) {
-        uint16_t stripped_len = strip_vendor_collections(saved_desc, saved_desc_len,
-                                                         s_mount_cleaned_desc, sizeof(s_mount_cleaned_desc));
-        if (stripped_len > 0) {
-            effective_desc = s_mount_cleaned_desc;
-            effective_desc_len = stripped_len;
-        }
-    }
 
     uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
     hid_instance_info_t *inst_info = alloc_hid_instance(dev_addr, instance);
@@ -3598,7 +3619,7 @@ int usb_hid_format_diagnostics(char *buf, size_t buf_size)
     return snprintf(buf, buf_size,
                     "KMBOX_PIO:ok=%lu,nak=%lu,err=%lu,mis=%lu,stl=%lu,ep=%u,e0=%02X/%u/%02X/%u,e1=%02X/%u/%02X/%u,e2=%02X/%u/%02X/%u\r\n"
                     "KMBOX_ITF:i0=%u/%u/%u/%u,i1=%u/%u/%u,ml=%u/%u/%u/%u,inst=%u/%u\r\n"
-                    "KMBOX_RX:cb=%lu,k=%lu,m=%lu,v=%lu,drp=%lu,ra=%lu,itf=%u,len=%u\r\n",
+                    "KMBOX_RX:cb=%lu,k=%lu,m=%lu,v=%lu,drp=%lu,ra=%lu,sr=%lu/%lu,itf=%u,len=%u\r\n",
                     (unsigned long)g_pio_usb_in_ok_cnt,
                     (unsigned long)g_pio_usb_in_nak_cnt,
                     (unsigned long)g_pio_usb_in_err_cnt,
@@ -3622,6 +3643,8 @@ int usb_hid_format_diagnostics(char *buf, size_t buf_size)
                     (unsigned long)g_hid_diag_rx_aux_cnt,
                     (unsigned long)g_hid_diag_rx_drop_cnt,
                     (unsigned long)g_hid_diag_rearm_cnt,
+                    (unsigned long)g_hid_diag_set_rep_q_cnt,
+                    (unsigned long)g_hid_diag_set_rep_ok_cnt,
                     (unsigned)g_hid_diag_last_itf,
                     (unsigned)g_hid_diag_last_len);
 }
@@ -3648,7 +3671,17 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t 
     (void)instance;
     (void)report_id;
     (void)report_type;
-    (void)len;
+    if (len > 0) {
+        g_hid_diag_set_rep_ok_cnt++;
+    }
+    if (g_set_report_busy) {
+        if (set_report_queue.tail != set_report_queue.head) {
+            __dmb();
+            set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
+        }
+        __dmb();
+        g_set_report_busy = false;
+    }
 }
 
 // HID device callbacks with improved validation
@@ -3790,30 +3823,45 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     // Forward other valid SET_REPORT requests only if declared on the mirrored interface
     if (buffer != NULL && bufsize > 0 &&
         host_hid_ready &&
-        instance < mirrored_itf_count && mirrored_itfs[instance].active &&
-        is_report_id_declared(&mirrored_itfs[instance], report_id)) {
+        instance < mirrored_itf_count && mirrored_itfs[instance].active) {
         mirrored_interface_t *mitf = &mirrored_itfs[instance];
+        uint8_t effective_rid = report_id;
+        const uint8_t *payload_ptr = buffer;
+        uint16_t payload_len = bufsize;
 
-        uint8_t next_head = (set_report_queue.head + 1) & VENDOR_QUEUE_MASK;
-        if (next_head != set_report_queue.tail) {
-            set_report_entry_t *e = &set_report_queue.entries[set_report_queue.head];
-            e->host_dev_addr = mitf->host_dev_addr;
-            e->host_instance = mitf->host_instance;
-            e->report_id = report_id;
-            e->report_type = (uint8_t)report_type;
-            if (report_id != 0) {
-                e->data[0] = report_id;
-                uint8_t copy_len = (bufsize >= (VENDOR_REPORT_MAX_LEN - 1)) ? (VENDOR_REPORT_MAX_LEN - 1) : (uint8_t)bufsize;
-                memcpy(&e->data[1], buffer, copy_len);
-                e->len = (uint8_t)(copy_len + 1);
-            } else {
-                e->len = (bufsize > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)bufsize;
-                memcpy(e->data, buffer, e->len);
+        // If received via Interrupt OUT endpoint (report_id == 0) on an interface
+        // that uses numbered reports, extract the leading Report ID byte.
+        if (effective_rid == 0 && !is_report_id_declared(mitf, 0) && is_report_id_declared(mitf, buffer[0])) {
+            effective_rid = buffer[0];
+            payload_ptr = buffer + 1;
+            payload_len = (uint16_t)(bufsize - 1);
+        }
+
+        if (is_report_id_declared(mitf, effective_rid)) {
+            uint8_t next_head = (set_report_queue.head + 1) & VENDOR_QUEUE_MASK;
+            if (next_head != set_report_queue.tail) {
+                set_report_entry_t *e = &set_report_queue.entries[set_report_queue.head];
+                e->host_dev_addr = mitf->host_dev_addr;
+                e->host_instance = mitf->host_instance;
+                e->report_id = effective_rid;
+                e->report_type = (uint8_t)report_type;
+                if (effective_rid != 0) {
+                    e->data[0] = effective_rid;
+                    uint8_t copy_len = (payload_len >= (VENDOR_REPORT_MAX_LEN - 1)) ? (VENDOR_REPORT_MAX_LEN - 1) : (uint8_t)payload_len;
+                    if (copy_len > 0) {
+                        memcpy(&e->data[1], payload_ptr, copy_len);
+                    }
+                    e->len = (uint8_t)(copy_len + 1);
+                } else {
+                    e->len = (payload_len > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)payload_len;
+                    memcpy(e->data, payload_ptr, e->len);
+                }
+                cache_report(instance, effective_rid, (uint8_t)report_type, payload_ptr,
+                             (payload_len > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)payload_len);
+                __dmb();
+                set_report_queue.head = next_head;
+                g_hid_diag_set_rep_q_cnt++;
             }
-            cache_report(instance, report_id, (uint8_t)report_type, buffer,
-                         (bufsize > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)bufsize);
-            __dmb();
-            set_report_queue.head = next_head;
         }
     }
 }
