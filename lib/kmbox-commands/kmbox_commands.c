@@ -141,12 +141,12 @@ static uint32_t get_random_release_time(void)
 
 static uint32_t get_random_click_press_time(void)
 {
-    // Unimodal bell-shaped human finger click hold duration:
-    // Sum of 3 independent uniform [22..43]ms values -> range [66..129]ms, mean ~97.5ms, stddev ~11ms
+    // Unimodal bell-shaped human finger click hold duration (calibrated to Logitech M170 ground truth ~126..141ms):
+    // Sum of 3 independent uniform [36..55]ms values -> range [108..165]ms, mean ~136.5ms, stddev ~10ms
     uint32_t r = kmbox_rng_next();
-    uint32_t u1 = 22u + ((r & 0xFFu) % 22u);
-    uint32_t u2 = 22u + (((r >> 8) & 0xFFu) % 22u);
-    uint32_t u3 = 22u + (((r >> 16) & 0xFFu) % 22u);
+    uint32_t u1 = 36u + ((r & 0xFFu) % 20u);
+    uint32_t u2 = 36u + (((r >> 8) & 0xFFu) % 20u);
+    uint32_t u3 = 36u + (((r >> 16) & 0xFFu) % 20u);
     return u1 + u2 + u3;
 }
 

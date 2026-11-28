@@ -389,20 +389,20 @@ static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
 
         // Fitts-aware frame spread for 125Hz (8ms) frames:
         // Small streaming steps (<20px) stay nimble (1-3 frames),
-        // while standalone macro jumps expand smoothly to natural human durations.
+        // while standalone macro jumps expand smoothly to natural human durations (~450-680ms).
         float movement_px = (float)max_component / (float)SMOOTH_FP_ONE;
         float multiplier = 1.0f;
         if (movement_px < 20.0f) {
             multiplier = 1.15f;
         } else if (movement_px < 80.0f) {
-            multiplier = 1.25f;
+            multiplier = 1.65f;
         } else {
-            multiplier = 1.35f;
+            multiplier = 2.15f;
         }
 
         uint32_t scaled = (uint32_t)((float)raw_frames * multiplier + 0.5f);
         if (scaled < 1u) scaled = 1u;
-        if (scaled > 80u) scaled = 80u;
+        if (scaled > 95u) scaled = 95u;
         frames = (uint8_t)scaled;
     }
     
@@ -653,9 +653,10 @@ bool smooth_inject_movement_fp(int32_t x_fp, int32_t y_fp, inject_mode_t mode) {
     int32_t perp_x_fp = -y_fp;
     int32_t perp_y_fp = x_fp;
     int32_t arc_sign = ((rng_next() & 1u) != 0u) ? 1 : -1;
-    // Lateral arc amplitude: 4.5%..7.5% of displacement for standalone movements >= 24px
+    // Lateral arc amplitude: 9%..15% of displacement for standalone movements >= 24px
+    // (calibrated to match human wrist pivot L/D ~ 1.05..1.08 without over-humanization).
     int32_t arc_factor_fp = (movement_px >= 24)
-                          ? (arc_sign * rng_range_fp(SMOOTH_FP_ONE * 45 / 1000, SMOOTH_FP_ONE * 75 / 1000))
+                          ? (arc_sign * rng_range_fp(SMOOTH_FP_ONE * 90 / 1000, SMOOTH_FP_ONE * 150 / 1000))
                           : 0;
 
     for (uint8_t i = 0; i < num_substeps; i++) {
@@ -891,8 +892,15 @@ apply_vel_filter:
         frame_x_fp = release_x;
         frame_y_fp = release_y;
 
-        // Soft saturation (replaces hard clamp for FULL mode)
-        int32_t max_fp = int_to_fp(g_smooth.max_per_frame);
+        // Soft saturation (replaces hard clamp for FULL mode):
+        // CRITICAL: g_smooth.max_per_frame represents target AVERAGE speed per 8ms frame
+        // for duration calculation. In a bell-shaped Minimum-Jerk / Sigma-Lognormal profile,
+        // peak velocity is ~3.0x average velocity. Setting the saturation ceiling to
+        // 3.5x max_per_frame prevents decapitating the bell curve peak while still clamping spikes.
+        int32_t peak_ceiling = (int32_t)g_smooth.max_per_frame * 7 / 2;
+        if (peak_ceiling < 28) peak_ceiling = 28;
+        if (peak_ceiling > 127) peak_ceiling = 127;
+        int32_t max_fp = int_to_fp((int16_t)peak_ceiling);
         int32_t sat_x = soft_saturate_fp(frame_x_fp, max_fp);
         int32_t sat_y = soft_saturate_fp(frame_y_fp, max_fp);
         // Return any capped excess back to debt (conserves movement)
@@ -1080,7 +1088,7 @@ static void smooth_set_humanization_mode_internal(humanization_mode_t mode, bool
         case HUMANIZATION_FULL:
             // Full humanization — calibrated for 125Hz (8ms) desktop mouse & button clicking:
             // Zero-drift subdivision with wrist arc, Minimum-Jerk bell curve, IIR velocity filter.
-            g_smooth.max_per_frame = 18;                                // Desktop default (~18 counts per 8ms frame)
+            g_smooth.max_per_frame = 14;                                // Desktop default (~14 avg counts/8ms frame, ~49 peak ceiling)
             g_smooth.velocity_matching_enabled = true;
             g_smooth.humanization.jitter_enabled = true;
             g_smooth.humanization.jitter_amount_fp = int_to_fp(1);      // 1.0px base (scaled to 0.38x zero-drift)
