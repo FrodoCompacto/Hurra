@@ -475,7 +475,13 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
     if (__builtin_expect(pkt[0] == FAST_CMD_MOUSE_MOVE, 1)) {
         const fast_cmd_move_t *m = (const fast_cmd_move_t *)pkt;
         if (m->buttons) kmbox_update_physical_buttons(m->buttons & 0x1F);
-        if (m->x || m->y) kmbox_add_mouse_movement(m->x, m->y);
+        if (m->x || m->y) {
+            if (smooth_get_humanization_mode() != HUMANIZATION_OFF) {
+                smooth_inject_movement(m->x, m->y, INJECT_MODE_SMOOTH);
+            } else {
+                kmbox_add_mouse_movement(m->x, m->y);
+            }
+        }
         if (m->wheel) kmbox_add_wheel_movement(m->wheel);
         // Passive LED activity — single volatile store, DMA pushes to PIO at ~30 Hz
         neopixel_signal_activity(COLOR_BRIDGE_ACTIVE);
@@ -810,14 +816,19 @@ static void perform_safe_reboot(bool enter_bootsel) {
 static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     (void)now_ms;
 
-    // Mouse move: M<x>,<y>
+    // Mouse move: M<x>,<y> — routed through smooth_inject_movement when humanization is active
+    // so text commands never accidentally produce a 1-frame raw teleport jump.
     if (len >= 3 && line[0] == 'M') {
         int16_t x, y;
         const char *p = parse_int16(line + 1, &x);
         if (p && *p == ',') {
             p = parse_int16(p + 1, &y);
             if (p) {
-                kmbox_add_mouse_movement(x, y);
+                if (smooth_get_humanization_mode() != HUMANIZATION_OFF) {
+                    smooth_inject_movement(x, y, INJECT_MODE_SMOOTH);
+                } else {
+                    kmbox_add_mouse_movement(x, y);
+                }
                 return true;
             }
         }
