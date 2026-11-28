@@ -29,7 +29,7 @@ void humanization_fpu_init(uint32_t seed);
  * Generate next jitter sample (runtime, non-periodic)
  * 
  * Combines layered sine oscillators at physiological tremor frequencies
- * (8-25Hz band) with LFSR noise to eliminate detectable periodicity.
+ * (8-25Hz band) with LFSR noise for smooth non-periodic variation.
  * 
  * @param scale Jitter magnitude multiplier
  * @param perp_x Output perpendicular X component

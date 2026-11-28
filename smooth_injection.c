@@ -9,7 +9,7 @@
  * - FPU-optimized runtime tremor generation (no LUTs, no periodicity)
  * - Layered sine oscillators at physiological tremor frequencies (8-25Hz)
  * - Perpendicular jitter for realistic path scatter
- * - Variable thresholds and timing to avoid fingerprinting
+ * - Variable thresholds and timing for natural movement variation
  * - Overshoot/correction patterns for realism
  */
 
@@ -467,10 +467,10 @@ static bool queue_single_substep(int32_t x_fp, int32_t y_fp, inject_mode_t mode,
 //--------------------------------------------------------------------+
 // Movement Subdivision for Humanization
 //
-// Instead of queuing a single large movement, break it into 4-8
+// Instead of queuing a single large movement, break it into 2-4
 // smaller sub-movements with randomized split ratios and independent
-// timing/easing per step. This creates a more organic movement
-// signature that's much harder to fingerprint.
+// timing/easing per step. This creates a smooth, natural movement
+// trajectory with a zero-drift biomechanical wrist arc.
 //
 // Subdivision strategy:
 // - Movements >= 3px: subdivide into 4-6 sub-steps

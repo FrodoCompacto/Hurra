@@ -2,7 +2,7 @@
  * FPU-Optimized Humanization Implementation
  * 
  * Runtime tremor generation using Cortex-M33 FPU instead of LUTs.
- * Eliminates detectable periodicity through layered incommensurate oscillators.
+ * Produces smooth non-periodic oscillation through layered incommensurate oscillators.
  *
  * FIXES applied:
  * 1. LFSR conversion: balanced [-1,1] mapping (was asymmetric, causing drift)

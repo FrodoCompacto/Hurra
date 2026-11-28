@@ -63,7 +63,7 @@ typedef enum {
     // Velocity-matched: Blend with current mouse velocity
     INJECT_MODE_VELOCITY_MATCHED,
 
-    // Micro: For tiny sub-pixel adjustments (anti-recoil, aim correction)
+    // Micro: For fine sub-pixel adjustments and host-streamed 125Hz curve steps
     INJECT_MODE_MICRO,
 } inject_mode_t;
 

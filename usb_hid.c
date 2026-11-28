@@ -819,7 +819,7 @@ static __force_inline int8_t clamp_i8(int32_t val) {
  * additional tremor/jitter. Tremor is only applied proportionally to the
  * synthetic (injected) fraction of the total movement. This keeps the
  * mouse feeling natural and responsive during normal use while still
- * humanizing injected/bot movement.
+ * smoothing injected movement.
  * 
  * Blend logic:
  *   - Pure physical movement (injected == 0): no tremor applied
@@ -1432,10 +1432,9 @@ static bool descriptor_has_consumer_collection(const uint8_t *desc, size_t len)
     return false;
 }
 
-// Strip vendor-specific HID collections (Logitech HID++ Report IDs 0x10/0x11,
-// Usage Page >= 0xFF00) from a cloned HID report descriptor.  Including these
-// in the proxy output descriptor causes host drivers (e.g. Logitech G HUB) to
-// open HID++ channels and flood control transfers that stall PIO-USB.
+// Strip vendor-specific HID collections (Usage Page >= 0xFF00, e.g. Report IDs
+// 0x10/0x11) from a cloned HID report descriptor so vendor configuration utilities
+// do not flood control transfers that stall PIO-USB.
 //
 // Tracks top-level collection boundaries so pre-collection preamble items
 // (Usage Page 0xFF00, Usage, Report ID) are cleanly rewound without leaving
@@ -2482,8 +2481,8 @@ void hid_device_task(void)
 
     // --- Track last-sent button state for change detection ---
     // Real mice send a report immediately on button state changes.
-    // A bridge-injected click with no movement must trigger a report
-    // on the very next poll — otherwise the delay is detectably wrong.
+    // A bridge-injected click with no movement triggers a report
+    // on the very next poll for responsive click delivery.
     // (last_sent_buttons / was_active are file-scope for cross-path sync)
 
     // ARCHITECTURE: Core0 is the ONLY core that calls tud_hid_report().
@@ -2594,10 +2593,8 @@ check_idle:
     }
 
     // --- Truly idle: NAK naturally (no report sent) ---
-    // When the mouse is idle, real mice NAK interrupt IN polls.
-    // Sending continuous zero reports when the real device wouldn't is
-    // itself a fingerprint.  So we intentionally do nothing here when
-    // a physical mouse is connected.
+    // When the mouse is idle, standard USB HID mice NAK interrupt IN polls
+    // rather than sending continuous zero reports.
 
     // Only send fallback reports when NO devices are connected at all
     // (standalone mode without a physical mouse/keyboard attached).
@@ -3026,9 +3023,9 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
     mounted_hid_itf_count++;
 
     // === SANITIZE REPORT DESCRIPTOR & DETERMINE EFFECTIVE PROTOCOL ===
-    // Strip vendor-defined top-level collections (0xFF00..0xFFFF, e.g. Logitech HID++
-    // 0x10/0x11) so G HUB / vendor software never probes the proxy as a configurable
-    // receiver while preserving Mouse, Consumer Control, and System Control collections.
+    // Strip vendor-defined top-level collections (0xFF00..0xFFFF) to avoid
+    // vendor control-channel polling while preserving Mouse, Consumer Control,
+    // and System Control collections.
     const uint8_t *effective_desc = saved_desc;
     uint16_t effective_desc_len = saved_desc_len;
 
